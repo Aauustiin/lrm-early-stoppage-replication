@@ -34,7 +34,7 @@ def main():
         answers = []
         answer_correctness = []
 
-        input_ids = tokenizer.encode(question, return_tensors="pt").to(model.device)
+        input_ids = tokenizer.encode(question + "\n", return_tensors="pt").to(model.device)
         attention_mask = torch.ones_like(input_ids)
 
         # Generate a response
@@ -42,7 +42,8 @@ def main():
             output_ids = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                max_new_tokens=128
+                max_new_tokens=128,
+                pad_token_id=tokenizer.eos_token_id
             )
 
         full_output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
@@ -53,14 +54,15 @@ def main():
         question_suffixes = ([""] + re.findall(r"<<.*?>>", full_output_text))[:-1]
 
         for idx in range(len(question_suffixes)):
-            prompt = question + "".join(question_suffixes[:idx+1]) + "###"
+            prompt = question + "\n".join(question_suffixes[:idx+1]) + "\n### "
             prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
             prompt_attention_mask = torch.ones_like(prompt_ids)
             with torch.no_grad():
                 step_output_ids = model.generate(
                     input_ids=prompt_ids,
                     attention_mask=prompt_attention_mask,
-                    max_new_tokens=128
+                    max_new_tokens=128,
+                    pad_token_id=tokenizer.eos_token_id
                 )
             step_output_text = tokenizer.decode(step_output_ids[0], skip_special_tokens=True)
             answer_output = step_output_text.split("#")[-1].replace(",", "").strip()
