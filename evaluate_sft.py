@@ -1,10 +1,16 @@
 import math
 import re
 import random
+import json
+import argparse
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import json
 from datasets import load_dataset
+
+def count_gold_steps(answer: str) -> int:
+    """Count reasoning steps in a GSM8k gold answer (lines before ####)."""
+    lines = [l.strip() for l in answer.strip().split("\n") if l.strip()]
+    return sum(1 for l in lines if not l.startswith("####"))
 
 def find_first_number(text):
     """Return (start, end, int_value) of the first positive integer in text."""
@@ -119,6 +125,13 @@ def early_stopping(question, ground_truth_answer, model, tokenizer):
     return results
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint-path", type=str, default="/users/cns542/scratch/coconut/gsm-cot/checkpoint_7")
+    parser.add_argument("--experiment", type=str, default="replication")
+    # Random seed
+    # Output file path
+    args = parser.parse_args()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     random.seed(42)
@@ -129,7 +142,7 @@ def main():
 
     # Load model weights
     saved_weights = torch.load(
-        "/users/cns542/scratch/coconut/gsm-cot/checkpoint_7",
+        args.checkpoint_path,
         map_location=device
     )
     model.load_state_dict(saved_weights, strict=False)
@@ -140,7 +153,182 @@ def main():
 
     ds = load_dataset("openai/gsm8k", "main")
 
-    results = []
+    if args.experiment == "replication":
+        results = []
+
+        for sample_idx, sample in enumerate(ds["test"]):
+            question = sample["question"]
+            ground_truth_answer = sample["answer"].split("####")[1].strip()
+            input_ids = tokenizer.encode(question + "\n", return_tensors="pt").to(model.device)
+            attention_mask = torch.ones_like(input_ids)
+            with torch.no_grad():
+                output_ids = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=128,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+
+            full_output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            final_answer = full_output_text.split("#")[-1].replace(",", "").strip()
+
+            steps = re.findall(r"<<.*?>>", full_output_text)
+            num_steps = len(steps)
+
+            partial_reasoning_traces = [""]
+            for step in steps[:-1]:
+                partial_reasoning_traces.append(partial_reasoning_traces[-1] + step + "\n")
+
+            for partial_reasoning_trace in partial_reasoning_traces:
+                prompt = question + "\n" + partial_reasoning_trace + "#### "
+                prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+                prompt_attention_mask = torch.ones_like(prompt_ids)
+                with torch.no_grad():
+                    output_ids = model.generate(
+                        input_ids=prompt_ids,
+                        attention_mask=prompt_attention_mask,
+                        max_new_tokens=128,
+                        pad_token_id=tokenizer.eos_token_id
+                    )
+                output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+                answer = output_text.split("#")[-1].replace(",", "").strip()
+                answers.append(answer)
+                if ground_truth_answer is not None:
+                    is_correct.append(answer == ground_truth_answer)
+    elif args.experiment == "patching":
+        results = []
+
+        for sample_idx, sample in enumerate(ds["test"]):
+            orig_question = sample["question"]
+            ground_truth_answer = sample["answer"].split("####")[1].strip()
+            num_gold_steps = count_gold_steps(sample["answer"])
+
+            orig_input_ids = tokenizer.encode(orig_question + "\n", return_tensors="pt").to(model.device)
+            orig_attention_mask = torch.ones_like(orig_input_ids)
+            with torch.no_grad():
+                orig_output_ids = model.generate(
+                    input_ids=orig_input_ids,
+                    attention_mask=orig_attention_mask,
+                    max_new_tokens=128,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+            orig_output_text = tokenizer.decode(orig_output_ids[0], skip_special_tokens=True)
+            orig_answer = orig_output_text.split("#")[-1].replace(",", "").strip()
+            orig_steps = re.findall(r"<<.*?>>", orig_output_text)
+            orig_num_steps = len(orig_steps)
+
+            start, end, orig_num = find_first_number(orig_question)
+            if orig_num is None:
+                results.append({
+                    "sample_idx": sample_idx,
+                    "orig_question": orig_question,
+                    "ground_truth_answer": ground_truth_answer,
+                    "num_gold_steps": num_gold_steps,
+                    "orig_answer": orig_answer,
+                    "is_correct": float(orig_answer) == float(ground_truth_answer),
+                    "orig_steps": orig_steps,
+                    "orig_num_steps": orig_num_steps,
+                    "aug_question": None,
+                    "aug_answer": None,
+                    "aug_steps": None,
+                    "aug_num_steps": None,
+                    "patching_answers": None,
+                    "patching_answer_categorisations": None,
+                    "error": "The question does not contain a positive integer."
+                })
+                continue
+
+            aug_num = rand_same_magnitude(orig_num)
+            aug_question = orig_question[:start] + str(aug_num) + orig_question[end:]
+
+            aug_input_ids = tokenizer.encode(aug_question + "\n", return_tensors="pt").to(model.device)
+            aug_attention_mask = torch.ones_like(aug_input_ids)
+            with torch.no_grad():
+                aug_output_ids = model.generate(
+                    input_ids=aug_input_ids,
+                    attention_mask=aug_attention_mask,
+                    max_new_tokens=128,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+            aug_output_text = tokenizer.decode(aug_output_ids[0], skip_special_tokens=True)
+            aug_answer = aug_output_text.split("#")[-1].replace(",", "").strip()
+            aug_steps = re.findall(r"<<.*?>>", aug_output_text)
+            aug_num_steps = len(aug_steps)
+
+            if (orig_num_steps != aug_num_steps) or (orig_answer == aug_answer):
+                error = []
+                if orig_num_steps != aug_num_steps:
+                    error.append("The model produced a different number of reasoning steps for the original and augmented questions.")
+                if orig_answer == aug_answer:
+                    error.append("The model's answers to the original and augmented questions are the same.")
+                
+                results.append({
+                    "sample_idx": sample_idx,
+                    "orig_question": orig_question,
+                    "ground_truth_answer": ground_truth_answer,
+                    "num_gold_steps": num_gold_steps,
+                    "orig_answer": orig_answer,
+                    "is_correct": float(orig_answer) == float(ground_truth_answer),
+                    "orig_steps": orig_steps,
+                    "orig_num_steps": orig_num_steps,
+                    "aug_question": aug_question,
+                    "aug_answer": aug_answer,
+                    "aug_steps": aug_steps,
+                    "aug_num_steps": aug_num_steps,
+                    "patching_answers": None,
+                    "patching_answer_categorisations": None,
+                    "error": ". ".join(error)
+                })
+                continue
+            else:
+                patching_answers = []
+                patching_answer_categorisations = []
+
+                for i in range(orig_num_steps):
+                    prompt = orig_question + "\n" + "\n".join(orig_steps[:i]) + "\n" + aug_steps[i] + "\n" + "\n".join(aug_steps[i+1:]) + "\n#### "
+                    prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+                    prompt_attention_mask = torch.ones_like(prompt_ids)
+                    with torch.no_grad():
+                        output_ids = model.generate(
+                            input_ids=prompt_ids,
+                            attention_mask=prompt_attention_mask,
+                            max_new_tokens=128,
+                            pad_token_id=tokenizer.eos_token_id
+                        )
+                    output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+                    answer = output_text.split("#")[-1].replace(",", "").strip()
+                    patching_answers.append(answer)
+
+                    if answer == orig_answer:
+                        patching_answer_categorisations.append("orig")
+                    elif answer == aug_answer:
+                        patching_answer_categorisations.append("aug")
+                    else:
+                        patching_answer_categorisations.append("other")
+
+                results.append({
+                    "sample_idx": sample_idx,
+                    "orig_question": orig_question,
+                    "ground_truth_answer": ground_truth_answer,
+                    "num_gold_steps": num_gold_steps,
+                    "orig_answer": orig_answer,
+                    "is_correct": float(orig_answer) == float(ground_truth_answer),
+                    "orig_steps": orig_steps,
+                    "orig_num_steps": orig_num_steps,
+                    "aug_question": aug_question,
+                    "aug_answer": aug_answer,
+                    "aug_steps": aug_steps,
+                    "aug_num_steps": aug_num_steps,
+                    "patching_answers": patching_answers,
+                    "patching_answer_categorisations": patching_answer_categorisations,
+                    "error": None
+                })
+
+        output = {
+            "accuracy": sum(r["is_correct"] for r in results) / len(results),
+            "results": results,
+        }
+
 
     # Process each question in the dataset
     for sample_idx, sample in enumerate(ds["test"]):
@@ -148,12 +336,7 @@ def main():
         ground_truth_answer = sample["answer"].split("####")[1].strip()
         original_result = early_stopping(question, ground_truth_answer, model, tokenizer)
 
-        start, end, orig = find_first_number(question)
-        if orig is None:
-            results.append({"sample_idx": sample_idx, "original_result": original_result, "skipped": "no_number"})
-            continue
-        new_num = rand_same_magnitude(orig)
-        aug_question = question[:start] + str(new_num) + question[end:]
+        
         augmented_result = early_stopping(aug_question, None, model, tokenizer)
 
         if original_result["num_steps"] == augmented_result["num_steps"]:
@@ -218,7 +401,7 @@ def main():
     accuracy = sum(r["original_result"]["is_correct"][-1] for r in results) / len(results)
 
     output = {
-        "model": "/users/cns542/scratch/coconut/gsm-cot/checkpoint_7",
+        "model": args.checkpoint_path,
         "dataset": "openai/gsm8k",
         "average_first_match_frac": average_first_match_frac,
         "average_stable_match_frac": average_stable_match_frac,

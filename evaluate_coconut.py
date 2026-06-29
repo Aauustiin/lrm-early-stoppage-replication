@@ -1,7 +1,6 @@
 import math
 import re
 import random
-import sys
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import json
