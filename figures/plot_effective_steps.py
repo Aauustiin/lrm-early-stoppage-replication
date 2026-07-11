@@ -6,33 +6,17 @@ plots, for each model:
 All three lines on one axes, with 95% CI bands.
 """
 
-import json
 from collections import defaultdict
 
 import numpy as np
 import matplotlib.pyplot as plt
-from datasets import load_dataset
 
+from plot_common import (
+    MODELS, DISPLAY_NAME, MODEL_COLOR, FIGURES_DIR,
+    load_gold_steps, load_results, bootstrap_mean_ci,
+)
 
-def count_gold_steps(answer: str) -> int:
-    lines = [l.strip() for l in answer.strip().split("\n") if l.strip()]
-    return sum(1 for l in lines if not l.startswith("####"))
-
-
-def mean_ci(values, z=1.96):
-    n = len(values)
-    if n == 0:
-        return 0.0, 0.0, 0.0
-    m = np.mean(values)
-    se = np.std(values, ddof=1) / np.sqrt(n) if n > 1 else 0.0
-    return m, m - z * se, m + z * se
-
-
-MODELS = {
-    "sft":     {"label": "SFT",     "color": "steelblue"},
-    "coconut": {"label": "CoCoNuT", "color": "darkorange"},
-    "codi":    {"label": "CODI",    "color": "forestgreen"},
-}
+MARKERS = {"coconut": "o", "codi": "s", "sft": "^"}
 
 
 def effective_metric(entry, model: str) -> float:
@@ -44,9 +28,7 @@ def effective_metric(entry, model: str) -> float:
 
 
 def main():
-    print("Loading GSM8k test split...", flush=True)
-    dataset = load_dataset("gsm8k", "main", split="test")
-    gold_steps = [count_gold_steps(ex["answer"]) for ex in dataset]
+    gold_steps = load_gold_steps()
 
     MIN_SAMPLES = 5
 
@@ -56,13 +38,8 @@ def main():
 
     model_data = {}
     for model in MODELS:
-        path = f"results/{model}.json"
-        print(f"Loading {path}...", flush=True)
-        with open(path) as f:
-            data = json.load(f)
-
+        data = load_results(model, expected_len=len(gold_steps))
         results = data["results"]
-        assert len(results) == len(dataset)
 
         buckets = defaultdict(list)
         for entry in results:
@@ -75,30 +52,32 @@ def main():
 
     step_counts = sorted(all_x)
 
-    for model, cfg in MODELS.items():
+    for model in MODELS:
         buckets = model_data[model]
         xs, ys, los, his = [], [], [], []
         for s in step_counts:
             if s not in buckets:
                 continue
-            m, lo, hi = mean_ci(buckets[s])
+            # Effective steps used isn't a [0, 1] fraction (it ranges up to
+            # ~6-8 depending on the model), so don't clamp the BCa interval.
+            m, lo, hi = bootstrap_mean_ci(buckets[s], bounds=None)
             xs.append(s)
             ys.append(m)
             los.append(lo)
             his.append(hi)
 
         xs = np.array(xs)
-        ax.plot(xs, ys, marker="o", color=cfg["color"], label=cfg["label"])
-        # ax.fill_between(xs, los, his, alpha=0.2, color=cfg["color"])
+        ax.plot(xs, ys, marker=MARKERS[model], color=MODEL_COLOR[model], label=DISPLAY_NAME[model])
+        ax.fill_between(xs, los, his, alpha=0.2, color=MODEL_COLOR[model], linewidth=0)
 
     ax.set_xlabel("Number of steps in gold reasoning trace")
     ax.set_ylabel("Effective steps used\n(stable_match_frac × total steps)")
-    ax.set_title("Effective steps used by gold reasoning trace length")
+    ax.set_title("Effective steps used by gold reasoning trace length\n(shaded band: 95% CI)")
     ax.set_xticks(step_counts)
     ax.legend()
     ax.grid(axis="y", linewidth=0.5, alpha=0.5)
 
-    out = "effective_steps_by_gold_steps.png"
+    out = FIGURES_DIR / "effective_steps_by_gold_steps.png"
     plt.tight_layout()
     plt.savefig(out, dpi=150)
     print(f"Saved {out}")

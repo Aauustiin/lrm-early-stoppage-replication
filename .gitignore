@@ -1,3 +1,29 @@
 .DS_Store
 .python-version
 __pycache__/
+
+# Generated evaluation results: multi-MB and each embeds the cluster
+# checkpoint path (incl. username) it was produced from -- regenerate with
+# evaluate_*.py instead of committing them.
+results/*.json
+
+# Local Claude Code settings (machine-specific, never shared)
+.claude/settings.local.json
+figures/.claude/settings.local.json
+
+# Secrets / environment files (e.g. HF_TOKEN)
+.env
+.env.*
+
+# Model checkpoints/weights, in case one ever ends up inside the repo
+*.bin
+*.pt
+*.ckpt
+*.safetensors
+
+# Editor/IDE
+.vscode/
+.idea/
+
+coconut.py
+codi.py

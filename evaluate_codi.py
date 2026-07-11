@@ -24,12 +24,10 @@ Requirements:
 
 import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-import math
 import re
 import sys
 import random
 import torch
-import json
 import torch.nn.functional as F
 import transformers
 from huggingface_hub import hf_hub_download
@@ -42,6 +40,7 @@ from datasets import load_dataset
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from codi import CODI, ModelArguments, TrainingArguments  # noqa: E402
+from eval_common import augment_question, match_fractions, slicing_status, aggregate_and_save  # noqa: E402
 
 torch.use_deterministic_algorithms(True)
 torch.backends.cudnn.deterministic = True
@@ -52,32 +51,7 @@ print(f"Using device: {device}")
 
 
 # ---------------------------------------------------------------------------
-# 2. Question-augmentation helpers (identical to evaluate_coconut.py /
-#    evaluate_sft.py).
-# ---------------------------------------------------------------------------
-def find_first_number(text):
-    """Return (start, end, int_value) of the first positive integer in text."""
-    for m in re.finditer(r'(?<!\d)(\d[\d,]*)(?!\d)', text):
-        try:
-            value = int(m.group(1).replace(',', ''))
-        except ValueError:
-            continue
-        if value > 0:
-            return m.start(1), m.end(1), value
-    return None, None, None
-
-
-def rand_same_magnitude(n):
-    """Random integer with same order of magnitude as n, guaranteed != n."""
-    mag = 10 ** math.floor(math.log10(n))
-    while True:
-        r = random.randint(mag, mag * 10 - 1)
-        if r != n:
-            return r
-
-
-# ---------------------------------------------------------------------------
-# 3. Answer extraction. CODI emits the answer directly after <EOT> (no
+# 2. Answer extraction. CODI emits the answer directly after <EOT> (no
 #    "#### " prefix as in the coconut / SFT training data), so we pull the
 #    last number out of the decoded text. We compare answers via float
 #    equality with a string fallback to absorb "42" vs "42.0" type mismatches
@@ -96,7 +70,7 @@ def answers_equal(a, b):
 
 
 # ---------------------------------------------------------------------------
-# 4. Generation: encode question -> N latent thoughts -> feed <EOT> -> decode.
+# 3. Generation: encode question -> N latent thoughts -> feed <EOT> -> decode.
 #    The N latent thoughts that are actually fed into the model as
 #    `inputs_embeds` are returned as a (N, hidden_size) tensor; these are the
 #    analogue of coconut's `latent_hidden_states` and are what gets sliced and
@@ -217,7 +191,7 @@ def generate(model, tokenizer, training_args, prompt,
 
 
 # ---------------------------------------------------------------------------
-# 5. Early-stopping analysis. Run the model with the full latent budget once
+# 4. Early-stopping analysis. Run the model with the full latent budget once
 #    (capturing the latents), then re-run with progressively more pre-supplied
 #    latents from that full run. Mirrors evaluate_coconut.py's early_stopping.
 # ---------------------------------------------------------------------------
@@ -255,23 +229,9 @@ def early_stopping(question, ground_truth_answer, model, tokenizer,
     if ground_truth_answer is not None:
         is_correct.append(answers_equal(final_answer, ground_truth_answer))
 
-    for idx, answer in enumerate(answers):
-        if answers_equal(answer, answers[-1]):
-            first_match = idx
-            break
-
-    stable_match = num_steps
-    for k in range(num_steps + 1):
-        if all(answers_equal(a, answers[-1]) for a in answers[k:]):
-            stable_match = k
-            break
-
-    if num_steps == 0:
-        first_match_frac = 0
-        stable_match_frac = 0
-    else:
-        first_match_frac = first_match / num_steps
-        stable_match_frac = stable_match / num_steps
+    first_match, stable_match, first_match_frac, stable_match_frac = match_fractions(
+        answers, num_steps, eq=answers_equal
+    )
 
     results = {
         "question": question,
@@ -304,7 +264,7 @@ def early_stopping(question, ground_truth_answer, model, tokenizer,
 
 
 # ---------------------------------------------------------------------------
-# 6. Main.
+# 5. Main.
 # ---------------------------------------------------------------------------
 def main():
     random.seed(42)
@@ -389,8 +349,8 @@ def main():
             num_steps=num_steps_default,
         )
 
-        start, end, orig = find_first_number(question)
-        if orig is None:
+        aug_question, _ = augment_question(question)
+        if aug_question is None:
             # No number to swap: record the original result and move on.
             del original_result["latent_reasoning_tokens"]
             results.append({
@@ -400,8 +360,6 @@ def main():
             })
             continue
 
-        new_num = rand_same_magnitude(orig)
-        aug_question = question[:start] + str(new_num) + question[end:]
         augmented_result = early_stopping(
             aug_question, None, model, tokenizer, training_args,
             num_steps=num_steps_default,
@@ -427,16 +385,12 @@ def main():
             answer = extract_answer(output_text)
             slicing_answers.append(answer)
 
-            orig_ans = original_result["model_answers"][i + 1]
-            aug_ans = augmented_result["model_answers"][i + 1]
-            if answers_equal(orig_ans, aug_ans):
-                answer_status.append("tie")
-            elif answers_equal(answer, orig_ans):
-                answer_status.append("original")
-            elif answers_equal(answer, aug_ans):
-                answer_status.append("augmented")
-            else:
-                answer_status.append("other")
+            answer_status.append(slicing_status(
+                answer,
+                original_result["model_answers"][i + 1],
+                augmented_result["model_answers"][i + 1],
+                eq=answers_equal,
+            ))
 
         # Drop the latent tensors before serialising.
         del original_result["latent_reasoning_tokens"]
@@ -454,49 +408,7 @@ def main():
             "slicing_tie_count": answer_status.count("tie"),
         })
 
-    # Aggregate.
-    average_first_match_frac = sum(
-        r["original_result"]["first_match_frac"] for r in results
-    ) / len(results)
-    average_stable_match_frac = sum(
-        r["original_result"]["stable_match_frac"] for r in results
-    ) / len(results)
-    slicing_original_count = sum(r.get("slicing_original_count") or 0 for r in results)
-    slicing_augmented_count = sum(r.get("slicing_augmented_count") or 0 for r in results)
-    slicing_other_count = sum(r.get("slicing_other_count") or 0 for r in results)
-    slicing_tie_count = sum(r.get("slicing_tie_count") or 0 for r in results)
-    slicing_total = (
-        slicing_original_count + slicing_augmented_count
-        + slicing_other_count + slicing_tie_count
-    )
-    slicing_original_proportion = slicing_original_count / slicing_total
-    slicing_augmented_proportion = slicing_augmented_count / slicing_total
-    slicing_other_proportion = slicing_other_count / slicing_total
-    slicing_tie_proportion = slicing_tie_count / slicing_total
-    accuracy = sum(
-        r["original_result"]["is_correct"][-1] for r in results
-    ) / len(results)
-
-    output = {
-        "model": "zen-E/CODI-gpt2",
-        "dataset": "openai/gsm8k",
-        "average_first_match_frac": average_first_match_frac,
-        "average_stable_match_frac": average_stable_match_frac,
-        "slicing_original_count": slicing_original_count,
-        "slicing_augmented_count": slicing_augmented_count,
-        "slicing_other_count": slicing_other_count,
-        "slicing_tie_count": slicing_tie_count,
-        "slicing_original_proportion": slicing_original_proportion,
-        "slicing_augmented_proportion": slicing_augmented_proportion,
-        "slicing_other_proportion": slicing_other_proportion,
-        "slicing_tie_proportion": slicing_tie_proportion,
-        "accuracy": accuracy,
-        "results": results,
-    }
-
-    with open("codi_gsm_results.json", "w") as f:
-        json.dump(output, f, indent=2)
-    print("\nResults saved to codi_gsm_results.json")
+    aggregate_and_save(results, "zen-E/CODI-gpt2", "openai/gsm8k", "results/codi.json")
 
 
 if __name__ == "__main__":

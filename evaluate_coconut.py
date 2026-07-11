@@ -1,31 +1,11 @@
-import math
-import re
+import argparse
 import random
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import json
 from datasets import load_dataset
 from coconut import Coconut
 
-def find_first_number(text):
-    """Return (start, end, int_value) of the first positive integer in text."""
-    for m in re.finditer(r'(?<!\d)(\d[\d,]*)(?!\d)', text):
-        try:
-            value = int(m.group(1).replace(',', ''))
-        except ValueError:
-            continue
-        if value > 0:
-            return m.start(1), m.end(1), value
-    return None, None, None
-
-
-def rand_same_magnitude(n):
-    """Random integer with same order of magnitude as n, guaranteed != n."""
-    mag = 10 ** math.floor(math.log10(n))
-    while True:
-        r = random.randint(mag, mag * 10 - 1)
-        if r != n:
-            return r
+from eval_common import augment_question, match_fractions, slicing_status, aggregate_and_save
 
 
 def early_stopping(question, ground_truth_answer, model, tokenizer, device):
@@ -81,23 +61,7 @@ def early_stopping(question, ground_truth_answer, model, tokenizer, device):
     if ground_truth_answer is not None:
         is_correct.append(final_answer == ground_truth_answer)
 
-    for idx, answer in enumerate(answers):
-        if answer == answers[-1]:
-            first_match = idx
-            break
-
-    stable_match = num_steps
-    for k in range(num_steps + 1):
-        if all(a == answers[-1] for a in answers[k:]):
-            stable_match = k
-            break
-
-    if num_steps == 0:
-        first_match_frac = 0
-        stable_match_frac = 0
-    else:
-        first_match_frac = first_match / num_steps
-        stable_match_frac = stable_match / num_steps
+    first_match, stable_match, first_match_frac, stable_match_frac = match_fractions(answers, num_steps)
 
     if ground_truth_answer is not None:
         results = {
@@ -128,7 +92,23 @@ def early_stopping(question, ground_truth_answer, model, tokenizer, device):
     return results
 
 
+CHECKPOINT_PATH = "/users/cns542/scratch/coconut/gsm-coconut-true/checkpoint_11"
+
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--no-force-answer",
+        action="store_true",
+        help=(
+            "Don't insert '### ' right after <|end-latent|>. By default it is "
+            "forced in so the model must answer immediately instead of "
+            "continuing on with explicit CoT text; pass this flag to let the "
+            "model decide on its own instead (for comparison)."
+        ),
+    )
+    args = parser.parse_args()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     random.seed(42)
@@ -148,16 +128,16 @@ def main():
     # Resize model embeddings
     model.resize_token_embeddings(len(tokenizer))
 
-    answer_prefix_ids = tokenizer.encode("### ", add_special_tokens=False)
+    answer_prefix_ids = (
+        None if args.no_force_answer
+        else tokenizer.encode("### ", add_special_tokens=False)
+    )
 
     # Initialise model
     model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id, answer_prefix_ids=answer_prefix_ids)
 
     # Load model weights
-    saved_weights = torch.load(
-        "/users/cns542/scratch/coconut/gsm-coconut-true/checkpoint_11",
-        map_location=device
-    )
+    saved_weights = torch.load(CHECKPOINT_PATH, map_location=device)
     model.load_state_dict(saved_weights, strict=False)
 
     # Move to GPU and set eval mode
@@ -174,14 +154,12 @@ def main():
         ground_truth_answer = sample["answer"].split("####")[1].strip()
         original_result = early_stopping(question, ground_truth_answer, model, tokenizer, device)
 
-        start, end, orig = find_first_number(question)
-        if orig is None:
+        aug_question, _ = augment_question(question)
+        if aug_question is None:
             # Remove latent reasoning tokens from results to save space
             del original_result["latent_reasoning_tokens"]
             results.append({"sample_idx": sample_idx, "original_result": original_result, "skipped": "no_number"})
             continue
-        new_num = rand_same_magnitude(orig)
-        aug_question = question[:start] + str(new_num) + question[end:]
         augmented_result = early_stopping(aug_question, None, model, tokenizer, device)
 
         answer_status = []
@@ -202,14 +180,11 @@ def main():
             answer = output_text.split("#")[-1].replace(",", "").strip()
             answers.append(answer)
 
-            if original_result["model_answers"][i+1] == augmented_result["model_answers"][i+1]:
-                answer_status.append("tie")
-            elif answer == original_result["model_answers"][i+1]:
-                answer_status.append("original")
-            elif answer == augmented_result["model_answers"][i+1]:
-                answer_status.append("augmented")
-            else:
-                answer_status.append("other")
+            answer_status.append(slicing_status(
+                answer,
+                original_result["model_answers"][i + 1],
+                augmented_result["model_answers"][i + 1],
+            ))
 
         # Remove latent reasoning tokens from results to save space
         del original_result["latent_reasoning_tokens"]
@@ -227,38 +202,11 @@ def main():
             "slicing_tie_count": answer_status.count("tie")
         })
 
-    average_first_match_frac = sum(r["original_result"]["first_match_frac"] for r in results) / len(results)
-    average_stable_match_frac = sum(r["original_result"]["stable_match_frac"] for r in results) / len(results)
-    slicing_original_count = sum(r.get("slicing_original_count") or 0 for r in results)
-    slicing_augmented_count = sum(r.get("slicing_augmented_count") or 0 for r in results)
-    slicing_other_count = sum(r.get("slicing_other_count") or 0 for r in results)
-    slicing_tie_count = sum(r.get("slicing_tie_count") or 0 for r in results)
-    slicing_original_proportion = slicing_original_count / (slicing_original_count + slicing_augmented_count + slicing_other_count + slicing_tie_count)
-    slicing_augmented_proportion = slicing_augmented_count / (slicing_original_count + slicing_augmented_count + slicing_other_count + slicing_tie_count)
-    slicing_other_proportion = slicing_other_count / (slicing_original_count + slicing_augmented_count + slicing_other_count + slicing_tie_count)
-    slicing_tie_proportion = slicing_tie_count / (slicing_original_count + slicing_augmented_count + slicing_other_count + slicing_tie_count)
-    accuracy = sum(r["original_result"]["is_correct"][-1] for r in results) / len(results)
-
-    output = {
-        "model": "/users/cns542/scratch/coconut/gsm-coconut-true/checkpoint_11",
-        "dataset": "openai/gsm8k",
-        "average_first_match_frac": average_first_match_frac,
-        "average_stable_match_frac": average_stable_match_frac,
-        "slicing_original_count": slicing_original_count,
-        "slicing_augmented_count": slicing_augmented_count,
-        "slicing_other_count": slicing_other_count,
-        "slicing_tie_count": slicing_tie_count,
-        "slicing_original_proportion": slicing_original_proportion,
-        "slicing_augmented_proportion": slicing_augmented_proportion,
-        "slicing_other_proportion": slicing_other_proportion,
-        "slicing_tie_proportion": slicing_tie_proportion,
-        "accuracy": accuracy,
-        "results": results,
-    }
-
-    with open("gpt2_coconut_gsm_results.json", "w") as f:
-        json.dump(output, f, indent=2)
-    print(f"\nResults saved to gpt2_coconut_gsm_results.json")
+    out_path = (
+        "results/coconut_no_force_answer.json" if args.no_force_answer
+        else "results/coconut.json"
+    )
+    aggregate_and_save(results, CHECKPOINT_PATH, "openai/gsm8k", out_path)
 
 
 if __name__ == "__main__":

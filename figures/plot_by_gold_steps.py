@@ -1,97 +1,14 @@
-import json
 import argparse
 from collections import defaultdict
-from statistics import NormalDist
 
 import numpy as np
 import matplotlib.pyplot as plt
-from datasets import load_dataset
 
-_NORM = NormalDist()
+from plot_common import (
+    FIGURES_DIR, DISPLAY_NAME, BLUE, ORANGE,
+    load_gold_steps, load_results, wilson_ci, bootstrap_mean_ci,
+)
 
-
-def count_gold_steps(answer: str) -> int:
-    lines = [l.strip() for l in answer.strip().split("\n") if l.strip()]
-    return sum(1 for l in lines if not l.startswith("####"))
-
-
-def wilson_ci(successes, n, z=1.96):
-    if n == 0:
-        return 0.0, 0.0, 0.0
-    p = successes / n
-    denom = 1 + z**2 / n
-    center = (p + z**2 / (2 * n)) / denom
-    half = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / denom
-    return center, center - half, center + half
-
-
-def bootstrap_mean_ci(values, alpha=0.05, n_boot=10000, seed=0):
-    """BCa bootstrap CI for the mean of a bounded [0, 1] quantity.
-
-    Returns (mean, lo, hi). The interval is non-parametric, respects the
-    [0, 1] support by construction, and does not assume symmetry -- which
-    matters because stable_match_frac tends to pile up against 1.0.
-
-    Special cases:
-      * all values in {0, 1}  -> Wilson interval (the mean is a binomial
-        proportion; the bootstrap degenerates at the boundary)
-      * zero sample variance  -> degenerate point interval
-    """
-    v = np.asarray(values, dtype=float)
-    n = v.size
-    if n == 0:
-        return float("nan"), float("nan"), float("nan")
-
-    m = float(v.mean())
-
-    if np.all((v == 0.0) | (v == 1.0)):
-        _, lo, hi = wilson_ci(float(v.sum()), n)
-        return m, max(0.0, lo), min(1.0, hi)
-
-    if n == 1 or np.ptp(v) == 0.0:
-        return m, m, m
-
-    rng = np.random.default_rng(seed)
-    boot = v[rng.integers(0, n, size=(n_boot, n))].mean(axis=1)
-
-    def percentile_interval():
-        return (m,
-                float(np.quantile(boot, alpha / 2)),
-                float(np.quantile(boot, 1 - alpha / 2)))
-
-    # Bias correction. The mid-p form (half credit for ties) keeps z0 finite
-    # when many resamples land exactly on the observed mean.
-    below = np.count_nonzero(boot < m) + 0.5 * np.count_nonzero(boot == m)
-    p0 = below / n_boot
-    if not 0.0 < p0 < 1.0:
-        return percentile_interval()
-    z0 = _NORM.inv_cdf(p0)
-
-    # Acceleration, estimated by jackknife (leave-one-out means).
-    jack = (v.sum() - v) / (n - 1)
-    u = jack.mean() - jack
-    denom = 6.0 * float(np.sum(u**2)) ** 1.5
-    a = float(np.sum(u**3)) / denom if denom > 0 else 0.0
-
-    quantiles = []
-    for q in (alpha / 2, 1 - alpha / 2):
-        zq = _NORM.inv_cdf(q)
-        scale = 1 - a * (z0 + zq)
-        if scale <= 0:
-            return percentile_interval()
-        adj = z0 + (z0 + zq) / scale
-        if not np.isfinite(adj):
-            return percentile_interval()
-        quantiles.append(min(max(_NORM.cdf(adj), 1 / n_boot), 1 - 1 / n_boot))
-
-    lo, hi = (float(np.quantile(boot, q)) for q in quantiles)
-    return m, max(0.0, lo), min(1.0, hi)
-
-
-DISPLAY_NAME = {"sft": "ERM", "coconut": "CoCoNuT", "codi": "CoDi"}
-
-BLUE = "#2a78d6"
-ORANGE = "#eb6834"
 MUTED = "#898781"
 GRID = "#e1e0d9"
 
@@ -110,19 +27,9 @@ def main():
                         help="Bootstrap seed, so reruns give identical bands")
     args = parser.parse_args()
 
-    print("Loading GSM8k test split...", flush=True)
-    dataset = load_dataset("gsm8k", "main", split="test")
-    gold_steps = [count_gold_steps(ex["answer"]) for ex in dataset]
-
-    results_path = f"results/{args.model}.json"
-    print(f"Loading {results_path}...", flush=True)
-    with open(results_path) as f:
-        data = json.load(f)
-
+    gold_steps = load_gold_steps()
+    data = load_results(args.model, expected_len=len(gold_steps))
     results = data["results"]
-    assert len(results) == len(dataset), (
-        f"Result count {len(results)} != dataset size {len(dataset)}"
-    )
 
     buckets = defaultdict(lambda: {"correct": [], "stable_match_frac": []})
 
@@ -184,7 +91,7 @@ def main():
         n = len(buckets[s]["correct"])
         ax.annotate(f"n={n}", (x[i], 0.02), ha="center", color=MUTED)
 
-    out = f"{args.model}_by_gold_steps.png"
+    out = FIGURES_DIR / f"{args.model}_by_gold_steps.png"
     plt.tight_layout()
     plt.savefig(out, dpi=150)
     print(f"Saved {out}")
