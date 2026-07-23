@@ -5,14 +5,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from plot_common import (
-    FIGURES_DIR, DISPLAY_NAME, BLUE, ORANGE,
+    FIGURES_DIR, DISPLAY_NAME, BLUE, ORANGE, FIGURE_WIDTH_IN,
     load_gold_steps, load_results, wilson_ci, bootstrap_mean_ci,
+    set_style, style_axes, legend_below, save_figure,
 )
 
-MUTED = "#898781"
-GRID = "#e1e0d9"
-
-plt.rcParams.update({"font.size": 14})
+set_style()
 
 
 def main():
@@ -65,37 +63,25 @@ def main():
     acc_means = np.array(acc_means)
     smf_means = np.array(smf_means)
 
-    fig, ax = plt.subplots(figsize=(9, 5.5))
+    fig, ax = plt.subplots(figsize=(FIGURE_WIDTH_IN, FIGURE_WIDTH_IN * 0.95))
 
-    ax.plot(x, acc_means, marker="o", markersize=8, linewidth=2,
+    ax.plot(x, acc_means, marker="o", markersize=5, linewidth=1.8, linestyle="-",
             color=BLUE, label="Accuracy")
     ax.fill_between(x, acc_lo, acc_hi, alpha=0.15, color=BLUE, linewidth=0)
 
-    ax.plot(x, smf_means, marker="s", markersize=8, linewidth=2,
-            color=ORANGE, label="Stable match fraction")
+    ax.plot(x, smf_means, marker="s", markersize=5, linewidth=1.8, linestyle="--",
+            color=ORANGE, label="Stable match")
     ax.fill_between(x, smf_lo, smf_hi, alpha=0.15, color=ORANGE, linewidth=0)
 
-    ax.set_xlabel("Number of steps in gold reasoning trace")
+    ax.set_xlabel("Gold reasoning steps")
     ax.set_ylabel("Fraction")
-    ax.set_title(f"{DISPLAY_NAME[args.model]}: accuracy & stable match fraction\nby gold reasoning steps")
+    ax.set_title(DISPLAY_NAME[args.model])
     ax.set_xticks(x)
     ax.set_ylim(0, 1.05)
-    ax.legend(frameon=False, loc="center right")
-    ax.grid(axis="y", linewidth=0.5, color=GRID, zorder=0)
-    ax.set_axisbelow(True)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+    legend_below(ax, ncol=2, y=-0.2)
+    style_axes(ax)
 
-    # Annotate sample counts
-    for i, s in enumerate(step_counts):
-        n = len(buckets[s]["correct"])
-        ax.annotate(f"n={n}", (x[i], 0.02), ha="center", color=MUTED)
-
-    out = FIGURES_DIR / f"{args.model}_by_gold_steps.png"
-    plt.tight_layout()
-    plt.savefig(out, dpi=150)
-    print(f"Saved {out}")
-    plt.show()
+    save_figure(fig, FIGURES_DIR / f"{args.model}_by_gold_steps.png")
 
 
 if __name__ == "__main__":

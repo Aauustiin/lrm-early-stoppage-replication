@@ -25,5 +25,15 @@ figures/.claude/settings.local.json
 .vscode/
 .idea/
 
-coconut.py
-codi.py
+slurm/*
+
+# LaTeX build byproducts (paper/acl_latex.pdf itself stays tracked)
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.synctex.gz
+paper/missfont.log

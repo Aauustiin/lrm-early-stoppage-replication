@@ -12,11 +12,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from plot_common import (
-    MODELS, DISPLAY_NAME, MODEL_COLOR, FIGURES_DIR,
+    MODELS, DISPLAY_NAME, MODEL_COLOR, MODEL_LINESTYLE, MODEL_MARKER,
+    FIGURES_DIR, FIGURE_WIDTH_IN,
     load_gold_steps, load_results, bootstrap_mean_ci,
+    set_style, style_axes, legend_below, save_figure,
 )
 
-MARKERS = {"coconut": "o", "codi": "s", "sft": "^"}
+set_style()
 
 
 def effective_metric(entry, model: str) -> float:
@@ -32,7 +34,7 @@ def main():
 
     MIN_SAMPLES = 5
 
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(FIGURE_WIDTH_IN, FIGURE_WIDTH_IN * 0.96))
 
     all_x = set()
 
@@ -67,21 +69,18 @@ def main():
             his.append(hi)
 
         xs = np.array(xs)
-        ax.plot(xs, ys, marker=MARKERS[model], color=MODEL_COLOR[model], label=DISPLAY_NAME[model])
+        ax.plot(xs, ys, marker=MODEL_MARKER[model], linestyle=MODEL_LINESTYLE[model],
+                markersize=5, linewidth=1.8, color=MODEL_COLOR[model], label=DISPLAY_NAME[model])
         ax.fill_between(xs, los, his, alpha=0.2, color=MODEL_COLOR[model], linewidth=0)
 
-    ax.set_xlabel("Number of steps in gold reasoning trace")
-    ax.set_ylabel("Effective steps used\n(stable_match_frac × total steps)")
-    ax.set_title("Effective steps used by gold reasoning trace length\n(shaded band: 95% CI)")
+    ax.set_xlabel("Gold reasoning steps")
+    ax.set_ylabel("Effective steps used")
     ax.set_xticks(step_counts)
-    ax.legend()
-    ax.grid(axis="y", linewidth=0.5, alpha=0.5)
+    legend_below(ax, ncol=3, y=-0.2,
+                 handlelength=1.3, handletextpad=0.4, columnspacing=1.0)
+    style_axes(ax)
 
-    out = FIGURES_DIR / "effective_steps_by_gold_steps.png"
-    plt.tight_layout()
-    plt.savefig(out, dpi=150)
-    print(f"Saved {out}")
-    plt.show()
+    save_figure(fig, FIGURES_DIR / "effective_steps_by_gold_steps.png")
 
 
 if __name__ == "__main__":

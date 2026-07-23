@@ -1,11 +1,14 @@
 import argparse
 import random
 import torch
+from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset
 from coconut import Coconut
 
-from eval_common import augment_question, match_fractions, slicing_status, aggregate_and_save
+from eval_common import (
+    DATASETS, augment_question, match_fractions, slicing_status,
+    aggregate_and_save, load_test_samples,
+)
 
 
 def early_stopping(question, ground_truth_answer, model, tokenizer, device):
@@ -92,11 +95,29 @@ def early_stopping(question, ground_truth_answer, model, tokenizer, device):
     return results
 
 
-CHECKPOINT_PATH = "/users/cns542/scratch/coconut/gsm-coconut-true/checkpoint_11"
+# Public checkpoints from https://huggingface.co/connordilgren -- raw
+# state_dicts, not from_pretrained-style models (same convention as
+# evaluate_codi.py's zen-E/CODI-gpt2 download). Unlike the CoT checkpoints,
+# each dataset's CoCoNuT checkpoint has its own filename (a different
+# training-epoch count each converged at).
+CHECKPOINT_REPO = {
+    "gsm8k": "connordilgren/gpt2-gsm8k-coconut",
+    "prosqa": "connordilgren/gpt2-prosqa-coconut",
+    "prontoqa": "connordilgren/gpt2-prontoqa-coconut",
+}
+CHECKPOINT_FILE = {
+    "gsm8k": "checkpoint_33",
+    "prosqa": "checkpoint_40",
+    "prontoqa": "checkpoint_36",
+}
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dataset", choices=DATASETS, default="gsm8k",
+        help="Which dataset's test split to evaluate on (default: gsm8k).",
+    )
     parser.add_argument(
         "--no-force-answer",
         action="store_true",
@@ -136,22 +157,23 @@ def main():
     # Initialise model
     model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id, answer_prefix_ids=answer_prefix_ids)
 
-    # Load model weights
-    saved_weights = torch.load(CHECKPOINT_PATH, map_location=device)
+    # Download and load model weights
+    checkpoint_path = hf_hub_download(
+        repo_id=CHECKPOINT_REPO[args.dataset], filename=CHECKPOINT_FILE[args.dataset]
+    )
+    saved_weights = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(saved_weights, strict=False)
 
     # Move to GPU and set eval mode
     model = model.to(device)
     model.eval()
 
-    ds = load_dataset("openai/gsm8k", "main")
+    samples = load_test_samples(args.dataset)
 
     results = []
 
     # Process each question in the dataset
-    for sample_idx, sample in enumerate(ds["test"]):
-        question = sample["question"]
-        ground_truth_answer = sample["answer"].split("####")[1].strip()
+    for sample_idx, (question, ground_truth_answer) in enumerate(samples):
         original_result = early_stopping(question, ground_truth_answer, model, tokenizer, device)
 
         aug_question, _ = augment_question(question)
@@ -202,11 +224,13 @@ def main():
             "slicing_tie_count": answer_status.count("tie")
         })
 
-    out_path = (
-        "results/coconut_no_force_answer.json" if args.no_force_answer
-        else "results/coconut.json"
-    )
-    aggregate_and_save(results, CHECKPOINT_PATH, "openai/gsm8k", out_path)
+    out_name = "coconut"
+    if args.dataset != "gsm8k":
+        out_name += f"_{args.dataset}"
+    if args.no_force_answer:
+        out_name += "_no_force_answer"
+    model_name = f"{CHECKPOINT_REPO[args.dataset]}/{CHECKPOINT_FILE[args.dataset]}"
+    aggregate_and_save(results, model_name, args.dataset, f"results/{out_name}.json")
 
 
 if __name__ == "__main__":

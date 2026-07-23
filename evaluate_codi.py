@@ -1,5 +1,5 @@
 """
-CODI-gpt2 evaluation on GSM8K.
+CODI-gpt2 evaluation on GSM8K, ProsQA, or PrOntoQA.
 
 Mirrors the evaluation done in evaluate_coconut.py / evaluate_sft.py:
   * For each test question, run the model with N=0..6 latent thoughts and
@@ -15,8 +15,16 @@ Mirrors the evaluation done in evaluate_coconut.py / evaluate_sft.py:
     slicing counts/proportions, and dump to JSON.
 
 Place this file next to `codi.py` (the one originally found in src/ of the
-CODI repo). It downloads the public checkpoint from
-https://huggingface.co/zen-E/CODI-gpt2 and runs it on GSM8K's test split.
+CODI repo). It downloads the public checkpoint (zen-E/CODI-gpt2 for GSM8K,
+connordilgren/gpt2-{prosqa,prontoqa}-codi for the other two -- all three are
+raw state_dicts from the same upstream CODI training codebase, just applied
+to different datasets) and runs it on the chosen dataset's test split.
+
+The augmentation/slicing analysis is GSM8K-only in practice: it swaps a
+number in the question, and ProsQA/PrOntoQA questions don't contain any --
+augment_question() naturally returns None for them, so every ProsQA/PrOntoQA
+sample takes the "no_number" skip path and only the early-stopping /
+matching-metrics analysis actually runs.
 
 Requirements:
     pip install torch transformers peft huggingface_hub safetensors accelerate datasets
@@ -26,13 +34,13 @@ import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 import re
 import sys
+import argparse
 import random
 import torch
 import torch.nn.functional as F
 import transformers
 from huggingface_hub import hf_hub_download
 from peft import LoraConfig, TaskType
-from datasets import load_dataset
 
 # ---------------------------------------------------------------------------
 # 1. Import CODI from codi.py (assumed to be in the same directory).
@@ -40,7 +48,10 @@ from datasets import load_dataset
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from codi import CODI, ModelArguments, TrainingArguments  # noqa: E402
-from eval_common import augment_question, match_fractions, slicing_status, aggregate_and_save  # noqa: E402
+from eval_common import (  # noqa: E402
+    DATASETS, augment_question, match_fractions, slicing_status,
+    aggregate_and_save, load_test_samples,
+)
 
 torch.use_deterministic_algorithms(True)
 torch.backends.cudnn.deterministic = True
@@ -49,17 +60,48 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 use_bf16 = device.type == "cuda"  # bf16 on GPU, float32 on CPU
 print(f"Using device: {device}")
 
+# Checkpoints -- all raw state_dicts from the same upstream CODI training
+# codebase, just applied to different datasets. GSM8K's is the original
+# authors' public checkpoint; the other two are connordilgren's own reruns
+# of that same codebase for the replicated paper (same "pytorch_model.bin"
+# filename convention as zen-E's).
+CHECKPOINT_REPO = {
+    "gsm8k": "zen-E/CODI-gpt2",
+    "prosqa": "connordilgren/gpt2-prosqa-codi",
+    "prontoqa": "connordilgren/gpt2-prontoqa-codi",
+}
+CHECKPOINT_FILE = "pytorch_model.bin"
+
 
 # ---------------------------------------------------------------------------
 # 2. Answer extraction. CODI emits the answer directly after <EOT> (no
-#    "#### " prefix as in the coconut / SFT training data), so we pull the
-#    last number out of the decoded text. We compare answers via float
-#    equality with a string fallback to absorb "42" vs "42.0" type mismatches
-#    that the regex can produce.
+#    "#### " prefix as in the coconut / SFT training data) and generation
+#    stops at EOS, so for GSM8K we pull the last number out of the decoded
+#    text (kept exactly as validated), and for ProsQA/PrOntoQA -- whose
+#    answers aren't numeric ("True"/"False", "X is a Y.") -- the
+#    already-EOS-terminated decoded text IS the answer, so it's used as-is.
+#    We compare answers via float equality with a string fallback to absorb
+#    "42" vs "42.0" type mismatches from the GSM8K regex (and this fallback
+#    is also what actually compares the ProsQA/PrOntoQA strings, since they
+#    aren't parseable as floats).
 # ---------------------------------------------------------------------------
-def extract_answer(text):
-    nums = re.findall(r"-?\d+\.?\d*", text.replace(",", ""))
-    return nums[-1] if nums else "(no number found)"
+_CODI_ANSWER_PREFIX = "The answer is:"
+
+
+def extract_answer(text, dataset):
+    if dataset == "gsm8k":
+        nums = re.findall(r"-?\d+\.?\d*", text.replace(",", ""))
+        return nums[-1] if nums else "(no number found)"
+    else:
+        text = text.strip()
+        # This checkpoint's ProsQA/PrOntoQA completions are consistently
+        # prefixed with "The answer is: " (unlike GSM8K, where the bare
+        # number follows <EOT> directly) -- strip it so the comparison
+        # against the dataset's bare ground-truth answer isn't a guaranteed
+        # mismatch.
+        if text.startswith(_CODI_ANSWER_PREFIX):
+            text = text[len(_CODI_ANSWER_PREFIX):].strip()
+        return text
 
 
 def answers_equal(a, b):
@@ -196,7 +238,7 @@ def generate(model, tokenizer, training_args, prompt,
 #    latents from that full run. Mirrors evaluate_coconut.py's early_stopping.
 # ---------------------------------------------------------------------------
 def early_stopping(question, ground_truth_answer, model, tokenizer,
-                   training_args, num_steps=6):
+                   training_args, dataset, num_steps=6):
     answers = []
     is_correct = []
 
@@ -205,7 +247,7 @@ def early_stopping(question, ground_truth_answer, model, tokenizer,
         model, tokenizer, training_args, question,
         num_latent_thoughts=num_steps,
     )
-    final_answer = extract_answer(full_output_text)
+    final_answer = extract_answer(full_output_text, dataset)
 
     # Replays with 0, 1, ..., num_steps-1 latents pre-supplied from the full run.
     for i in range(num_steps):
@@ -220,7 +262,7 @@ def early_stopping(question, ground_truth_answer, model, tokenizer,
                 num_latent_thoughts=i,
                 latent_reasoning_tokens=latent_hidden_states[:i],
             )
-        answer = extract_answer(output_text)
+        answer = extract_answer(output_text, dataset)
         answers.append(answer)
         if ground_truth_answer is not None:
             is_correct.append(answers_equal(answer, ground_truth_answer))
@@ -267,6 +309,13 @@ def early_stopping(question, ground_truth_answer, model, tokenizer,
 # 5. Main.
 # ---------------------------------------------------------------------------
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dataset", choices=DATASETS, default="gsm8k",
+        help="Which dataset's test split to evaluate on (default: gsm8k).",
+    )
+    args = parser.parse_args()
+
     random.seed(42)
 
     # Args + LoRA config (match the released checkpoint, scripts/test_gpt2.sh).
@@ -308,9 +357,9 @@ def main():
     print("Building CODI model (downloads base GPT-2 if not cached)...")
     model = CODI(model_args, training_args, lora_config)
 
-    print("Downloading CODI-gpt2 checkpoint from HuggingFace Hub...")
+    print(f"Downloading {CHECKPOINT_REPO[args.dataset]} checkpoint from HuggingFace Hub...")
     ckpt_path = hf_hub_download(
-        repo_id="zen-E/CODI-gpt2", filename="pytorch_model.bin"
+        repo_id=CHECKPOINT_REPO[args.dataset], filename=CHECKPOINT_FILE
     )
     print(f"Checkpoint at: {ckpt_path}")
 
@@ -335,18 +384,15 @@ def main():
         tokenizer.pad_token_id = model.pad_token_id
 
     # Dataset.
-    ds = load_dataset("openai/gsm8k", "main")
+    samples = load_test_samples(args.dataset)
 
     results = []
     num_steps_default = 6
 
-    for sample_idx, sample in enumerate(ds["test"]):
-        question = sample["question"]
-        ground_truth_answer = sample["answer"].split("####")[1].strip().replace(",", "")
-
+    for sample_idx, (question, ground_truth_answer) in enumerate(samples):
         original_result = early_stopping(
             question, ground_truth_answer, model, tokenizer, training_args,
-            num_steps=num_steps_default,
+            args.dataset, num_steps=num_steps_default,
         )
 
         aug_question, _ = augment_question(question)
@@ -362,7 +408,7 @@ def main():
 
         augmented_result = early_stopping(
             aug_question, None, model, tokenizer, training_args,
-            num_steps=num_steps_default,
+            args.dataset, num_steps=num_steps_default,
         )
 
         # Slicing analysis: for each i in 0..num_steps-1, run with the first i
@@ -382,7 +428,7 @@ def main():
                 num_latent_thoughts=i + 1,
                 latent_reasoning_tokens=mixed_latents,
             )
-            answer = extract_answer(output_text)
+            answer = extract_answer(output_text, args.dataset)
             slicing_answers.append(answer)
 
             answer_status.append(slicing_status(
@@ -408,7 +454,12 @@ def main():
             "slicing_tie_count": answer_status.count("tie"),
         })
 
-    aggregate_and_save(results, "zen-E/CODI-gpt2", "openai/gsm8k", "results/codi.json")
+    out_path = (
+        "results/codi.json" if args.dataset == "gsm8k"
+        else f"results/codi_{args.dataset}.json"
+    )
+    model_name = f"{CHECKPOINT_REPO[args.dataset]}/{CHECKPOINT_FILE}"
+    aggregate_and_save(results, model_name, args.dataset, out_path)
 
 
 if __name__ == "__main__":

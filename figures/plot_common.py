@@ -6,8 +6,11 @@ import json
 from pathlib import Path
 from statistics import NormalDist
 
+import matplotlib
 import numpy as np
+import matplotlib.pyplot as plt
 from datasets import load_dataset
+from PIL import Image as PILImage
 
 FIGURES_DIR = Path(__file__).resolve().parent
 RESULTS_DIR = FIGURES_DIR.parent / "results"
@@ -36,6 +39,127 @@ MODEL_COLOR = dict(zip(MODELS, PALETTE))
 # The blue/orange pair used for 2-series metric comparisons (e.g. accuracy
 # vs. stable-match fraction), validated as a high-contrast pair.
 BLUE, ORANGE = PALETTE[0], PALETTE[7]
+
+# Distinct line style / marker / bar hatch per fixed-order slot, paired with
+# PALETTE so identity survives grayscale printing too, not just color --
+# ACL formatting guidance asks figures not to rely on color alone. Applied
+# in the same fixed order as PALETTE/MODEL_COLOR.
+LINESTYLES = ["-", "--", ":", "-."]
+MARKERS = ["o", "s", "^", "D"]
+HATCHES = ["", "///", "xx", ".."]
+
+MODEL_LINESTYLE = dict(zip(MODELS, LINESTYLES))
+MODEL_MARKER = dict(zip(MODELS, MARKERS))
+
+# --- Shared figure sizing --------------------------------------------------
+# Every figure in the paper is placed at (or very close to) one ACL column
+# width -- 7.7cm, per paper/formatting.md -- whether it's a single-column
+# figure (`width=\columnwidth`) or one half of a two-up `figure*` pair
+# (`width=0.48\linewidth` of a ~16.1cm two-column spread, ~7.7cm too). Every
+# figure is authored at FIGURE_WIDTH_IN with a matching font size so that
+# once LaTeX scales the PNG down to that width, in-figure text renders at
+# a fixed physical size, _ACL_BODY_FONT_PT (deliberately smaller than the
+# paper's 11pt body text -- see formatting.md -- so in-figure text reads as
+# a caption/label register, not body copy). A script can author at a wider
+# native canvas (e.g. to give crowded x-tick labels more room) as long as
+# it scales the font size to match -- that's what
+# font_size_for_width()/set_style(width_in=...) are for.
+#
+# This invariant only holds if the saved PNG's actual (tight-bbox) width
+# matches the width_in used to compute its font size -- e.g. a legend or
+# rotated tick labels that overflow the nominal canvas will widen the
+# saved image beyond width_in, which silently shrinks the effective text
+# size once LaTeX scales it back down to column width. Check a script's
+# actual output width (px / FIGURE_DPI) against its width_in if its text
+# looks off relative to the other figures.
+FIGURE_WIDTH_IN = 6.0
+_ACL_COLUMN_WIDTH_IN = 7.7 / 2.54
+_ACL_BODY_FONT_PT = 8
+FIGURE_DPI = 200
+
+
+def font_size_for_width(width_in=FIGURE_WIDTH_IN):
+    return round(_ACL_BODY_FONT_PT * width_in / _ACL_COLUMN_WIDTH_IN)
+
+
+FONT_SIZE = font_size_for_width()
+
+MUTED = "#898781"
+GRID = "#e1e0d9"
+
+
+def set_style(width_in=FIGURE_WIDTH_IN):
+    """Apply the shared figure design system (call once, before plotting)."""
+    plt.rcParams.update({
+        "font.size": font_size_for_width(width_in),
+        "font.family": "serif",  # match the paper's Times body text
+    })
+
+
+def style_axes(ax):
+    """Shared axis chrome: no top/right spine, muted gridlines behind data."""
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(axis="y", linewidth=0.6, color=GRID, zorder=0)
+    ax.set_axisbelow(True)
+
+
+def legend_below(ax, ncol, y=-0.32, **kwargs):
+    """Frameless legend in a single row below the axes -- at body-text-sized
+    fonts an in-plot legend collides with data far too easily, so every
+    figure in this project puts its legend in the same place instead.
+
+    Extra **kwargs (e.g. handlelength, handletextpad, columnspacing) pass
+    through to ax.legend() -- useful for a many-column legend whose default
+    spacing would render wider than the axes, forcing bbox_inches="tight"
+    to pad the saved canvas and making the actual plot look shrunken.
+    """
+    return ax.legend(loc="upper center", bbox_to_anchor=(0.5, y), ncol=ncol,
+                      frameon=False, **kwargs)
+
+
+def _tight_width_in(fig):
+    """Actual PNG width (inches) after the bbox_inches="tight" trim -- may
+    differ from the canvas width_in a script authored at, since trimming
+    isn't proportional to font size (see save_figure)."""
+    import io
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.12)
+    buf.seek(0)
+    with PILImage.open(buf) as im:
+        return im.size[0] / FIGURE_DPI
+
+
+def save_figure(fig, out, width_in=FIGURE_WIDTH_IN):
+    """Save with a tight-bbox trim (removes excess whitespace, and rescues
+    content -- e.g. a rotated axis label -- that would otherwise clip) and
+    report the path. Relies on bbox_inches alone for layout, not
+    tight_layout(), since the two can fight each other's margins.
+
+    `width_in` is the canvas width the script authored at (and passed to
+    set_style()/font_size_for_width() to pick its font size) -- normally
+    FIGURE_WIDTH_IN. The bbox_inches="tight" trim doesn't remove whitespace
+    proportionally to font size, so the actual saved width can drift from
+    width_in (a wide legend or dense tick labels trim less; a sparse plot
+    trims more). Left uncorrected, that drift silently mis-scales the
+    in-figure text once LaTeX scales the PNG back down to column width: a
+    saved image *wider* than width_in gets shrunk *more* than the font size
+    assumed, so its text renders smaller than intended (and vice versa for
+    a narrower saved image) -- so two figures at the same nominal font size
+    can render at different physical sizes in the paper. This measures the
+    actual width and, if it's off from width_in by more than 1%, scales
+    every text artist's font size by (measured / width_in) -- bigger for an
+    over-wide save, smaller for an under-wide one -- before the final save.
+    """
+    measured = _tight_width_in(fig)
+    scale = measured / width_in
+    if abs(scale - 1) > 0.01:
+        for t in fig.findobj(matplotlib.text.Text):
+            t.set_fontsize(t.get_fontsize() * scale)
+        measured = _tight_width_in(fig)
+    fig.savefig(out, dpi=FIGURE_DPI, bbox_inches="tight", pad_inches=0.12)
+    print(f"Saved {out} ({measured:.3f}in actual vs {width_in:.3f}in nominal)")
+
 
 _NORM = NormalDist()
 
