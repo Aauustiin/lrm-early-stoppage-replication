@@ -46,7 +46,7 @@ DATASET_KEYS = ['gsm8k', 'prosqa', 'prontoqa']
 DATASET_DISPLAY = {'gsm8k': 'GSM8K', 'prosqa': 'ProsQA', 'prontoqa': 'PrOntoQA'}
 
 METRICS = ['first-match', 'stable-match']
-METRIC_TITLE = {'first-match': 'First Match', 'stable-match': 'Stable Match'}
+METRIC_TITLE = {'first-match': 'First match fraction', 'stable-match': 'Stable match fraction'}
 PER_SAMPLE_FIELD = {'first-match': 'first_match_frac', 'stable-match': 'stable_match_frac'}
 
 # Numbers reported by the original paper being replicated (Figure 3 of
@@ -71,7 +71,19 @@ ORIGINAL = {
 }
 
 
+# coconut.json forces COCONUT to answer immediately after its latent
+# reasoning tokens; this figure uses the no-forced-answer variant instead
+# (see evaluate_coconut.py's --no-force-answer), consistent with
+# gold_steps_grid.py, so its curve reflects the model's own answer timing
+# like CODI's and the ERM's. No no-force-answer variant exists for
+# ProsQA/PrOntoQA, so only the gsm8k entry is overridden.
+RESULTS_FILENAME_OVERRIDE = {('coconut', 'gsm8k'): 'coconut_no_force_answer.json'}
+
+
 def results_path(model: str, dataset: str):
+    override = RESULTS_FILENAME_OVERRIDE.get((model, dataset))
+    if override:
+        return RESULTS_DIR / override
     suffix = '' if dataset == 'gsm8k' else f'_{dataset}'
     return RESULTS_DIR / f'{model}{suffix}.json'
 

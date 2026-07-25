@@ -53,6 +53,31 @@ def load_test_samples(dataset):
         raise ValueError(f"Unknown dataset {dataset!r}, expected one of {DATASETS}")
 
 
+def load_prosqa_gold_steps():
+    """question -> gold `steps` list (the correct reasoning chain, as
+    written in the paper's data files), keyed by exact question text.
+
+    Used by augment_question's ProsQA branch to identify the "<Name> is a
+    <word>." base fact that's actually load-bearing for the gold
+    derivation. A purely textual heuristic (e.g. "first" or "last"
+    occurrence of the queried entity's base fact) doesn't reliably find
+    it: the gold fact sits at a roughly uniform position among a
+    question's same-name facts (~3 per question on average), not
+    reliably first or last (confirmed empirically: first-occurrence
+    matches the gold fact only 37% of the time, last-occurrence 44%).
+    This does a second fetch of the same JSON load_test_samples("prosqa")
+    already reads (and discards the "steps" field from) -- kept as a
+    separate call rather than changing load_test_samples's return shape,
+    since that shape is relied on as a plain (question, answer) 2-tuple
+    across all of evaluate_sft.py / evaluate_coconut.py / evaluate_codi.py
+    / evaluate_copying_bias_prosqa.py.
+    """
+    url = f"{_LRM_PAPER_REPO_RAW}/data/prosqa_test.json"
+    with urllib.request.urlopen(url) as response:
+        samples = json.load(response)
+    return {s["question"]: s["steps"] for s in samples}
+
+
 def split_reasoning_steps(dataset, full_output_text):
     """Split a CoT/SFT model's own generated reasoning (the decoded
     question + generated continuation) into individual steps, for use in
@@ -129,6 +154,66 @@ def step_token_counts(tokenizer, gen_ids, num_steps):
     return counts
 
 
+# ProsQA's trailing query sentence, e.g. "Is Sally a hilpus or sterpus?" --
+# captures the queried entity's name.
+QUERY_NAME_RE = re.compile(r"Is (\w+) a \w+ or \w+\?")
+
+# ProsQA's "Every Y is a Z." rule sentences, capturing (Y, Z) in the order
+# they appear in the text.
+RULE_RE = re.compile(r"Every (\w+) is a (\w+)\.")
+
+
+def find_replacement_word(question, word_to_replace):
+    """First "Every Y is a Z." rule word (Y or Z, in problem-statement
+    order) that isn't `word_to_replace`, or None if every such word is
+    identical to it.
+
+    Used by evaluate_copying_bias_prosqa.py's causal-intervention
+    experiment, where an *implausible* replacement is the point (mirrors
+    the paper's GSM8K copying-bias experiment, whose injected number
+    "has no plausible connection to the question"). For a genuine minimal
+    pair that provably changes the question's correct answer, see
+    augment_question's ProsQA branch instead -- this plain "first different
+    word" choice reaches the *original* correct answer 43% of the time
+    (i.e. doesn't change it) and reaches neither query option 26% of the
+    time (i.e. isn't well-posed at all).
+    """
+    for y, z in RULE_RE.findall(question):
+        for w in (y, z):
+            if w != word_to_replace:
+                return w
+    return None
+
+
+# ProsQA's trailing query sentence, capturing both named options, e.g.
+# "Is Sally a hilpus or sterpus?" -> ("hilpus", "sterpus").
+QUERY_OPTIONS_RE = re.compile(r"Is \w+ a (\w+) or (\w+)\?")
+
+
+def _prosqa_target_and_neg_target(question, gold_steps):
+    """(target, neg_target): the correct and incorrect class words from a
+    ProsQA question's trailing "Is NAME a OPT1 or OPT2?" query -- whichever
+    of OPT1/OPT2 the gold reasoning chain (gold_steps) ends on is target,
+    the other is neg_target. (None, None) if the query or final gold step
+    doesn't parse as expected.
+    """
+    m = QUERY_OPTIONS_RE.search(question)
+    if m is None:
+        return None, None
+    opt1, opt2 = m.groups()
+    last_step_match = re.match(r".+ is a (\w+)\.$", gold_steps[-1])
+    if last_step_match is None:
+        return None, None
+    target = last_step_match.group(1)
+    if target == opt1:
+        neg_target = opt2
+    elif target == opt2:
+        neg_target = opt1
+    else:
+        return None, None
+    return target, neg_target
+
+
 def find_first_number(text):
     """Return (start, end, int_value) of the first positive integer in text."""
     for m in re.finditer(r'(?<!\d)(\d[\d,]*)(?!\d)', text):
@@ -150,16 +235,61 @@ def rand_same_magnitude(n):
             return r
 
 
-def augment_question(question):
-    """Swap the first positive integer in `question` for a same-magnitude
-    random one. Returns (augmented_question, orig_number), or (None, None)
-    if the question has no number to swap.
+def augment_question(question, dataset, prosqa_gold_steps=None):
+    """Create a minimal-pair "augmented" version of `question`, for use in
+    the early-stopping / slicing-splice analysis (Section 5). Returns
+    (augmented_question, orig_value), or (None, None) if `question` has no
+    augmentable structure for `dataset`.
+
+    GSM8K: swap the first positive integer in the question for a
+    same-magnitude random one.
+
+    ProsQA: swap every occurrence of the query's two named options,
+    `target` <-> `neg_target` (see _prosqa_target_and_neg_target), wherever
+    they appear in the question -- in the "Every Y is a Z." rules, and in
+    the trailing query sentence itself. This is a pure relabelling: any
+    valid derivation chain that used to conclude `target` now concludes
+    `neg_target` (its every occurrence was renamed to `neg_target`, and
+    vice versa), so the question's correct answer is *guaranteed* to flip,
+    with no reachability search needed. It also tends to touch more of the
+    gold reasoning chain than editing a single fact would (target/neg_target
+    each typically appear in more than one rule), which produces more
+    surface-level divergence between the original and augmented traces.
+    Superseded a fact-search approach (find_answer_flipping_word, removed)
+    that had to prove a reachability property to guarantee validity and
+    still failed to find a valid word ~2.8% of the time -- this construction
+    is valid unconditionally, by symbol-renaming, so it has no such failure
+    mode (beyond the query/gold-step parse failing outright).
+
+    PrOntoQA has no such swappable structure recognised yet, so it always
+    returns (None, None), same as a numberless GSM8K question.
     """
-    start, end, orig = find_first_number(question)
-    if orig is None:
+    if dataset == "gsm8k":
+        start, end, orig = find_first_number(question)
+        if orig is None:
+            return None, None
+        new_num = rand_same_magnitude(orig)
+        return question[:start] + str(new_num) + question[end:], orig
+    elif dataset == "prosqa":
+        if prosqa_gold_steps is None:
+            raise ValueError(
+                "augment_question(dataset='prosqa') requires "
+                "prosqa_gold_steps=load_prosqa_gold_steps()"
+            )
+        steps = prosqa_gold_steps.get(question)
+        if not steps:
+            return None, None
+        target, neg_target = _prosqa_target_and_neg_target(question, steps)
+        if target is None:
+            return None, None
+        swap = {target: neg_target, neg_target: target}
+        pattern = re.compile(
+            rf"\b({re.escape(target)}|{re.escape(neg_target)})\b"
+        )
+        augmented = pattern.sub(lambda m: swap[m.group(1)], question)
+        return augmented, target
+    else:
         return None, None
-    new_num = rand_same_magnitude(orig)
-    return question[:start] + str(new_num) + question[end:], orig
 
 
 def match_fractions(answers, num_steps, eq=operator.eq):

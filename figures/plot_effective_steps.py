@@ -1,11 +1,12 @@
 """
 Bins GSM8k test samples by number of steps in the gold reasoning trace and
-plots, for each model:
-  - CODI / COCONUT: mean(stable_match_frac * 6)   [effective latent tokens used]
-  - SFT:            mean(num_steps * stable_match_frac)  [effective text steps used]
+plots, for each model, the average raw stable_match step count in that
+bucket (the smallest k such that the model's answer at step k onward always
+matches its final answer -- not divided by the model's step budget).
 All three lines on one axes, with 95% CI bands.
 """
 
+import argparse
 from collections import defaultdict
 
 import numpy as np
@@ -22,15 +23,16 @@ set_style()
 
 
 def effective_metric(entry, model: str) -> float:
-    r = entry["original_result"]
-    if model == "sft":
-        return r["num_steps"] * r["stable_match_frac"]
-    else:  # coconut / codi — 6 latent steps per implicit reasoning step
-        return r["stable_match_frac"] * 6
+    return entry["original_result"]["stable_match"]
 
 
 def main():
-    gold_steps = load_gold_steps()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", choices=["gsm8k", "prosqa", "prontoqa"],
+                        default="gsm8k", help="Which dataset's results to plot (default: gsm8k)")
+    args = parser.parse_args()
+
+    gold_steps = load_gold_steps(args.dataset)
 
     MIN_SAMPLES = 5
 
@@ -40,7 +42,7 @@ def main():
 
     model_data = {}
     for model in MODELS:
-        data = load_results(model, expected_len=len(gold_steps))
+        data = load_results(model, dataset=args.dataset, expected_len=len(gold_steps))
         results = data["results"]
 
         buckets = defaultdict(list)
@@ -60,7 +62,7 @@ def main():
         for s in step_counts:
             if s not in buckets:
                 continue
-            # Effective steps used isn't a [0, 1] fraction (it ranges up to
+            # Raw stable_match isn't a [0, 1] fraction (it ranges up to
             # ~6-8 depending on the model), so don't clamp the BCa interval.
             m, lo, hi = bootstrap_mean_ci(buckets[s], bounds=None)
             xs.append(s)
@@ -74,13 +76,14 @@ def main():
         ax.fill_between(xs, los, his, alpha=0.2, color=MODEL_COLOR[model], linewidth=0)
 
     ax.set_xlabel("Gold reasoning steps")
-    ax.set_ylabel("Effective steps used")
+    ax.set_ylabel("Stable Match")
     ax.set_xticks(step_counts)
     legend_below(ax, ncol=3, y=-0.2,
                  handlelength=1.3, handletextpad=0.4, columnspacing=1.0)
     style_axes(ax)
 
-    save_figure(fig, FIGURES_DIR / "effective_steps_by_gold_steps.png")
+    suffix = "" if args.dataset == "gsm8k" else f"_{args.dataset}"
+    save_figure(fig, FIGURES_DIR / f"effective_steps_by_gold_steps{suffix}.png")
 
 
 if __name__ == "__main__":

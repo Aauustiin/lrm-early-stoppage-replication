@@ -1,7 +1,8 @@
 # lrm-early-stoppage-replication
 
 Replication and analysis of early-stopping / stable-answer behavior on
-GSM8K, ProsQA, and PrOntoQA for three reasoning approaches:
+GSM8K, ProsQA, and PrOntoQA for three reasoning approaches, written up in
+`paper/acl_latex.tex`:
 
 - **ERM / SFT** — a GPT-2 model fine-tuned with explicit textual
   chain-of-thought, using the public `connordilgren/gpt2-{dataset}-cot`
@@ -22,25 +23,31 @@ combination, every test question is run through:
    reasoning step (text step for ERM, latent "thought" for CoCoNuT/CODI),
    and see how early the answer first matches / permanently matches the
    final answer (`first_match_frac` / `stable_match_frac`). This is the
-   analysis behind the paper's Section 3 replication (Table 1, Figure 2) and
-   is what all three datasets run.
-2. **Question augmentation** — swap the first number in the question for a
-   random same-magnitude number, and re-run early stopping on it.
+   analysis behind the paper's Section 3 replication (Table 1, Figures 2-3)
+   and its Section 4 task-difficulty analysis (Figure 4), and is what all
+   three datasets run.
+2. **Question augmentation** — build a minimal-pair "augmented" question
+   whose correct answer is guaranteed to differ from the original, and
+   re-run early stopping on it. GSM8K: swap the first number in the
+   question for a random same-magnitude number. ProsQA: swap the query's
+   two named class options everywhere they appear in the question (a pure
+   symbol relabelling, so the correct answer is guaranteed to flip). See
+   `eval_common.augment_question`.
 3. **Slicing** — splice a reasoning step from the augmented run into the
    original run's trace, and check whether the resulting answer still
    tracks the original question, has switched to the augmented question, or
-   neither (`original` / `augmented` / `other` / `tie`).
+   neither (`original` / `augmented` / `other` / `tie`). This is the
+   analysis behind the paper's Section 5 copying-bias experiment.
 
-Steps 2-3 (Sections 4-5 of the paper) are GSM8K-only in practice: they swap
-a number in the question, and ProsQA/PrOntoQA questions don't contain any
-— `augment_question()` naturally returns `None` for them, so every
-ProsQA/PrOntoQA sample takes the "no_number" skip path and only the
-early-stopping analysis (step 1) actually runs.
+Steps 2-3 (Section 5 of the paper) run for GSM8K and ProsQA. PrOntoQA has
+no augmentable structure recognised yet — `augment_question()` naturally
+returns `None` for it, so every PrOntoQA sample takes the `"no_augmentation"`
+skip path and only the early-stopping analysis (step 1) actually runs; the
+paper explicitly leaves a PrOntoQA version of Section 5 for future work.
 
-There's also a fourth, ERM/GSM8K-only analysis (`evaluate_copying_bias.py`):
-swap the numeric result of the ERM's final explicit reasoning step for a
-random same-magnitude number and force an answer, to see how often the
-ERM's answer just copies that (otherwise meaningless) number.
+There are also a few standalone scripts for analyses **not currently used
+in the paper** — see [Other analyses](#other-analyses-not-in-the-paper)
+below.
 
 ## Setup
 
@@ -71,6 +78,8 @@ for reproducibility. If you hit Hugging Face Hub rate limits, set an
   CI math), and the generated PNGs.
 - `slurm/` — job scripts for running the evaluations on the University of
   York's Viking HPC cluster.
+- `paper/` — the ACL-format writeup (`acl_latex.tex`), built in place (see
+  [Building the paper](#building-the-paper)).
 
 ## 1. Run an evaluation
 
@@ -102,7 +111,7 @@ python evaluate_coconut.py [--dataset {gsm8k,prosqa,prontoqa}] [--no-force-answe
 | Option | Meaning |
 |---|---|
 | `--dataset` | Which dataset's test split to evaluate on (default: `gsm8k`). |
-| `--no-force-answer` | By default, the string `"### "` is inserted immediately after the `<\|end-latent\|>` token so the model is forced to answer right away instead of continuing on with its own explicit-CoT text. Pass this flag to disable that and let the model decide on its own — useful for an ablation comparing forced vs. free-form answering. |
+| `--no-force-answer` | By default, the string `"### "` is inserted immediately after the `<\|end-latent\|>` token so the model is forced to answer right away instead of continuing on with its own explicit-CoT text. Pass this flag to disable that and let the model decide on its own — used by some of the paper's GSM8K figures (see below) so COCONUT's curve reflects its own answer timing, like CODI's and the ERM's. No such variant was run for ProsQA/PrOntoQA. |
 
 Automatically downloads the public `connordilgren/gpt2-{dataset}-coconut`
 checkpoint from the Hugging Face Hub (`checkpoint_33`/`_40`/`_36` for
@@ -132,33 +141,6 @@ own reruns of the same upstream CODI training codebase on those datasets).
 Output: `results/codi.json` (`gsm8k`), or `results/codi_{dataset}.json`
 otherwise.
 
-### `evaluate_copying_bias.py` (ERM copying-bias experiment, GSM8K-only)
-
-```
-python evaluate_copying_bias.py [--checkpoint-path PATH]
-```
-
-| Option | Meaning |
-|---|---|
-| `--checkpoint-path` | Path to the GPT-2 SFT checkpoint (`state_dict`) to load. Same default/meaning as `evaluate_sft.py`'s `gsm8k` default. |
-
-Same model, GSM8K test split, and per-truncation-length forced-answer
-protocol as `evaluate_sft.py`'s early-stopping analysis (Section 3), except
-at each truncation length the numeric result of the truncated trace's last
-explicit reasoning step (e.g. the `24` in `<<48/2=24>>`) is swapped for a
-random number of the same magnitude (`rand_same_magnitude()` from
-`eval_common.py`) before forcing an answer, instead of leaving it as
-generated. This gives one trial per truncation length per question (skipped
-for a given length if that step's result isn't a plain positive integer).
-GSM8K-only, like the augmentation/slicing analysis: it relies on the same
-"swap a number in the reasoning trace" mechanic, which doesn't apply to
-ProsQA/PrOntoQA.
-
-Output: `results/copying_bias.json` — includes `match_rate` (fraction of
-trials where the model's forced answer equals the random number),
-`num_trials`, `num_samples`, and per-question `results` (each with a list
-of per-truncation-length `trials`).
-
 ## 2. Running the evaluations on Viking (SLURM)
 
 `slurm/` has job scripts for running the evaluations above on the
@@ -167,7 +149,8 @@ one per evaluation, plus a second CoCoNuT job for the `--no-force-answer`
 variant). Each script's python invocation matches its section-1 form above,
 and `evaluate_sft.py` / `evaluate_coconut.py` / `evaluate_copying_bias.py`
 pick up the checkpoint paths already hardcoded in those scripts — edit the
-scripts (not the job files) if you need to point at a different checkpoint.
+scripts (not the job files) if you need to point at a different
+checkpoint.
 
 Setup (once, on a login node — no GPU needed):
 
@@ -198,9 +181,9 @@ sbatch slurm/evaluate_codi.slurm
 sbatch slurm/evaluate_copying_bias.slurm
 ```
 
-For the ProsQA/PrOntoQA Section 3 replication (early-stopping /
-matching-metrics only -- see the dataset note above), submit the
-six-task array covering all three models on both datasets:
+For the ProsQA/PrOntoQA replication (early-stopping, and — for ProsQA —
+the augmentation/slicing analysis too), submit the six-task array covering
+all three models on both datasets:
 
 ```
 sbatch slurm/evaluate_prosqa_prontoqa_array.slurm
@@ -226,101 +209,160 @@ not meant to be run directly.
 > directory, not `slurm/` in your checkout, and fails to find `common.sh`.
 > `$SLURM_SUBMIT_DIR` isn't affected by the copy.
 
+Note: the ERM/SFT scripts are small enough (GPT-2 small, short forced
+generations) that a full 500-1,319-question evaluation also completes in a
+few minutes on CPU — you don't strictly need a GPU allocation for
+`evaluate_sft.py`. CoCoNuT/CODI's `generate()` calls are more expensive and
+are the ones that actually benefit from a GPU.
+
 ## 3. Figures
 
-Figure scripts only read `results/*.json` (no GPU needed) plus the GSM8K
-test split for the ones binning by gold-step count. Run them from anywhere
-— output paths are resolved relative to the script's own location, not the
-working directory.
+Figure scripts only read `results/*.json` (no GPU needed) plus the gold
+reasoning-step counts for the ones binning by that (GSM8K's test split via
+`datasets`, ProsQA/PrOntoQA's via the same repo the results themselves come
+from). Run them from anywhere — output paths are resolved relative to the
+script's own location, not the working directory.
 
-### `figures/plot_by_gold_steps.py`
-
-```
-python figures/plot_by_gold_steps.py MODEL [--min-samples N] [--n-boot N] [--seed N]
-```
-
-| Option | Meaning |
-|---|---|
-| `MODEL` | One of `sft`, `coconut`, `codi` (required). |
-| `--min-samples` | Minimum samples a gold-step bucket needs to be plotted (default: 5). |
-| `--n-boot` | Bootstrap resamples for the stable-match-fraction CI (default: 10000). |
-| `--seed` | Bootstrap RNG seed, so bands are identical across reruns (default: 0). |
-
-Plots accuracy (Wilson 95% CI) and stable-match fraction (BCa bootstrap 95%
-CI) against the number of gold reasoning steps, for one model.
-
-Output: `figures/{model}_by_gold_steps.png`
-
-### `figures/plot_slicing.py`
+### `figures/gold_steps_grid.py` — used in the paper (Figure 3, Figure 7)
 
 ```
-python figures/plot_slicing.py [--effective-only]
+python figures/gold_steps_grid.py [--dataset {gsm8k,prosqa,prontoqa}]
+```
+
+1x3 grid (COCONUT, CODI, ERM) of accuracy (Wilson 95% CI) and stable-match
+fraction (BCa bootstrap 95% CI) against the number of gold reasoning steps,
+sharing one legend and axis labels — this is what's actually embedded in
+the paper, not `plot_by_gold_steps.py` below.
+
+Output: `figures/gold_steps_grid.png` (`gsm8k`), or
+`figures/gold_steps_grid_{dataset}.png` otherwise.
+
+### `figures/plot_slicing.py` — used in the paper (Figure 5, Figure 6)
+
+```
+python figures/plot_slicing.py [--dataset {gsm8k,prosqa,prontoqa}] [--effective-only]
 ```
 
 | Option | Meaning |
 |---|---|
-| `--effective-only` | Restrict to slicing trials that spliced into an *effective* step -- one before the original run's answer had already stabilized (index `i` < that question's `stable_match`, the same quantity behind `plot_effective_steps.py`). Drops trials on already-redundant steps, where a splice couldn't have changed the answer regardless of any copying bias. |
+| `--dataset` | Which dataset's results to plot (default: `gsm8k`). PrOntoQA has no slicing data (see the dataset note above), so only `gsm8k`/`prosqa` are meaningful. |
+| `--effective-only` | Restrict to slicing trials that spliced into an *effective* step -- one before the original run's answer had already stabilized (index `i` < that question's `stable_match`, the same quantity behind `plot_effective_steps.py`). Drops trials on already-redundant steps, where a splice couldn't have changed the answer regardless of any copying bias. **The paper only uses the `--effective-only` figures** (the unrestricted ones are commented out in `acl_latex.tex`, kept as a reference point in the source). |
 
 Plots all three models at once. Stacked bar chart of the slicing-analysis
 answer status (`original` / `augmented` / `other` / `tie`) per model, with
 95% CI error bars from a cluster bootstrap over *questions* (steps within a
 question aren't independent, so resampling individual steps would
-understate the uncertainty).
+understate the uncertainty). "0%" segment labels are suppressed (a segment
+can round to 0% while still containing a few real trials — see the
+category's raw count in `results/*.json` if you need the exact number).
 
-Output: `figures/slicing_status.png` (`figures/slicing_status_effective.png` with `--effective-only`)
+Output: `figures/slicing_status{_effective}{_dataset}.png`, e.g.
+`figures/slicing_status_effective_prosqa.png`.
 
-### `figures/plot_effective_steps.py`
-
-```
-python figures/plot_effective_steps.py
-```
-
-No CLI options. For all three models, plots the mean "effective steps
-used" (`stable_match_frac × total steps`) against the number of gold
-reasoning steps, with BCa bootstrap 95% CI bands.
-
-Output: `figures/effective_steps_by_gold_steps.png`
-
-### `figures/replication_graph.py`
+### `figures/plot_effective_steps.py` — used in the paper (Figure 4)
 
 ```
-python figures/replication_graph.py [METRIC]
+python figures/plot_effective_steps.py [--dataset {gsm8k,prosqa,prontoqa}]
 ```
 
-| Option | Meaning |
-|---|---|
-| `METRIC` | `first-match` or `stable-match` (default: `first-match`). |
+For all three models, plots the mean "effective steps used"
+(`stable_match_frac × total steps`) against the number of gold reasoning
+steps, with BCa bootstrap 95% CI bands. The paper only uses the `gsm8k`
+(default) output.
 
-Bar chart comparing the original paper's reported numbers (no CI — there's
-no per-sample data behind a single published number) against our own
-replication numbers (95% bootstrap CI error bars), for all three models.
+Output: `figures/effective_steps_by_gold_steps.png` (`gsm8k`), or
+`figures/effective_steps_by_gold_steps_{dataset}.png` otherwise.
 
-Output: `figures/first_match.png` or `figures/stable_match.png`
-
-## Typical workflow
+### `figures/replication_grid.py` — used in the paper (Figure 2)
 
 ```
-# 1. Run the evaluations you need (GPU + checkpoints required)
+python figures/replication_grid.py
+```
+
+No CLI options; always plots all three datasets. 2x3 grid (rows: first
+match / stable match; columns: GSM8K / ProsQA / PrOntoQA) comparing the
+original paper's reported numbers (no CI — there's no per-sample data
+behind a single published number) against our own replication numbers (95%
+bootstrap CI error bars), for all three models. Uses
+`results/coconut_no_force_answer.json` for the GSM8K/COCONUT panel (see
+`evaluate_coconut.py --no-force-answer` above); every other cell uses the
+default (forced-answer) result file.
+
+Output: `figures/replication_grid.png`
+
+### Superseded standalone scripts (not used in the paper)
+
+`figures/plot_by_gold_steps.py` (single-model version of
+`gold_steps_grid.py`) and `figures/replication_graph.py` (single-dataset,
+single-metric version of `replication_grid.py`) still work and are useful
+for a quick one-off look at a single model/dataset/metric, but neither's
+output is embedded in `acl_latex.tex` — the grid versions above replaced
+them. See each script's `--help` for usage.
+
+## Reproducing the paper's figures and tables
+
+Assuming you already have all the model checkpoints available (see
+Section 1), this is the full sequence from a clean `results/` directory to
+everything `acl_latex.tex` includes:
+
+```
+# 1. Evaluations -- GSM8K (10 result files; COCONUT needs both variants)
 python evaluate_sft.py
 python evaluate_coconut.py
+python evaluate_coconut.py --no-force-answer
 python evaluate_codi.py
-python evaluate_copying_bias.py
 
-# 1b. Section 3 (early-stopping / matching-metrics) on the other two
-#     datasets -- see the dataset note above for why only this analysis
-#     (not augmentation/slicing) runs for these two
+# 1b. ProsQA (adds the augmentation/slicing analysis automatically)
 python evaluate_sft.py --dataset prosqa
 python evaluate_coconut.py --dataset prosqa
 python evaluate_codi.py --dataset prosqa
+
+# 1c. PrOntoQA (early-stopping only -- see the dataset note above)
 python evaluate_sft.py --dataset prontoqa
 python evaluate_coconut.py --dataset prontoqa
 python evaluate_codi.py --dataset prontoqa
 
-# 2. Figures (only need results/*.json from step 1; GSM8K-only for now --
-#    none of the figures/*.py scripts plot the prosqa/prontoqa results yet)
-python figures/plot_by_gold_steps.py sft
-python figures/plot_slicing.py
-python figures/plot_slicing.py --effective-only
-python figures/plot_effective_steps.py
-python figures/replication_graph.py
+# 2. Figures
+python figures/replication_grid.py                        # Figure 2 (fig:replication)
+python figures/gold_steps_grid.py                          # Figure 3 (fig:steps)
+python figures/plot_effective_steps.py                     # Figure 4 (fig:effective)
+python figures/plot_slicing.py --effective-only            # Figure 5 (fig:copy-effective)
+python figures/plot_slicing.py --dataset prosqa --effective-only   # Figure 6 (fig:copy-effective-prosqa)
+python figures/gold_steps_grid.py --dataset prosqa         # Figure 7, appendix (fig:steps-prosqa)
 ```
+
+Table 1 (`tab:performance`)'s accuracy numbers and the appendix's
+sample-exclusion tables (`tab:exclusion*`) are transcribed by hand from
+each run's `accuracy` / `slicing_*_count` fields in `results/*.json` — they
+aren't auto-generated into the `.tex` file.
+
+## Building the paper
+
+`paper/acl_latex.tex` is a standard two-pass `pdflatex` document; build it
+in place (its figure `\includegraphics` paths are relative to `paper/`,
+which is why the PNGs above are read straight from `figures/` — copy or
+symlink them into `paper/` first, or point `\graphicspath` there, if
+they're not already alongside `acl_latex.tex`):
+
+```
+cd paper
+pdflatex -interaction=nonstopmode -halt-on-error acl_latex.tex
+pdflatex -interaction=nonstopmode -halt-on-error acl_latex.tex   # second pass resolves cross-references
+```
+
+Output: `paper/acl_latex.pdf`.
+
+## Other analyses (not in the paper)
+
+A few scripts explore questions the paper doesn't currently report on —
+kept for reference / future work, not wired into any figure above:
+
+- **`evaluate_copying_bias.py`** / **`evaluate_copying_bias_prosqa.py`** —
+  an earlier, simpler version of the Section 5 copying-bias question: at
+  each truncation length, swap the last explicit reasoning step's numeric
+  result (GSM8K) or last word (ProsQA) for an implausible replacement and
+  see how often the ERM's forced answer copies it. Superseded in the paper
+  by the augmentation/slicing analysis above, which tests a *valid*
+  minimal-pair alternative rather than an implausible one, but its results
+  are still interesting as a simpler baseline. Output:
+  `results/copying_bias.json` / `results/copying_bias_prosqa.json`.

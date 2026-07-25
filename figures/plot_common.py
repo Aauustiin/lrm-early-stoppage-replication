@@ -3,6 +3,8 @@ plot_effective_steps.py, plot_by_gold_steps.py).
 """
 
 import json
+import urllib.request
+from collections import defaultdict
 from pathlib import Path
 from statistics import NormalDist
 
@@ -170,19 +172,57 @@ def count_gold_steps(answer: str) -> int:
     return sum(1 for l in lines if not l.startswith("####"))
 
 
-def load_gold_steps():
-    """Load the GSM8K test split and return its per-sample gold step counts."""
-    print("Loading GSM8k test split...", flush=True)
-    dataset = load_dataset("gsm8k", "main", split="test")
-    return [count_gold_steps(ex["answer"]) for ex in dataset]
+# ProsQA/PrOntoQA aren't mirrored on the Hugging Face Hub, so their test
+# splits are fetched directly from the replicated paper's own repo, pinned to
+# a fixed commit. Duplicated from eval_common.py's _LRM_PAPER_REPO_* rather
+# than imported -- this project's figures/ scripts are meant to run
+# standalone from any working directory (see README), and every other
+# gold-step source here (including GSM8K's, below) is likewise fetched
+# directly rather than reusing eval_common.py's copy.
+_LRM_PAPER_REPO_COMMIT = "32f413d8d55239d9bc54bb6b6ec37b0630891ed4"
+_LRM_PAPER_REPO_RAW = (
+    "https://raw.githubusercontent.com/connordilgren/are-lrms-easily-interpretable"
+    f"/{_LRM_PAPER_REPO_COMMIT}"
+)
 
 
-def load_results(model: str, expected_len: int | None = None):
-    """Load results/{model}.json. If `expected_len` is given (typically
-    len(gold_steps) from load_gold_steps()), assert the results cover every
-    GSM8K test sample.
+def load_gold_steps(dataset: str = "gsm8k"):
+    """Return the per-sample gold reasoning step counts for `dataset`'s test
+    split, in the same sample order as evaluate_*.py's `sample_idx`.
+
+    GSM8K: derived from the gold answer's calculator-notation lines (see
+    count_gold_steps). ProsQA/PrOntoQA: each test sample's gold reasoning
+    chain is already segmented into a "steps" list by the source data, so
+    the gold step count is just its length -- no parsing needed.
     """
-    path = RESULTS_DIR / f"{model}.json"
+    if dataset == "gsm8k":
+        print("Loading GSM8k test split...", flush=True)
+        ds = load_dataset("gsm8k", "main", split="test")
+        return [count_gold_steps(ex["answer"]) for ex in ds]
+    elif dataset in ("prosqa", "prontoqa"):
+        print(f"Loading {dataset} test split...", flush=True)
+        url = f"{_LRM_PAPER_REPO_RAW}/data/{dataset}_test.json"
+        with urllib.request.urlopen(url) as response:
+            samples = json.load(response)
+        return [len(s["steps"]) for s in samples]
+    else:
+        raise ValueError(f"Unknown dataset {dataset!r}")
+
+
+def load_results(model: str, dataset: str = "gsm8k", expected_len: int | None = None,
+                  filename: str | None = None):
+    """Load a results/*.json file for `model`/`dataset`. If `expected_len` is
+    given (typically len(gold_steps) from load_gold_steps()), assert the
+    results cover every test sample.
+
+    Filename matches evaluate_sft.py/evaluate_coconut.py/evaluate_codi.py's
+    output convention: results/{model}.json for gsm8k (the default dataset),
+    results/{model}_{dataset}.json otherwise. Pass `filename` to override
+    this, e.g. to pick a same-model variant like coconut_no_force_answer.json.
+    """
+    if filename is None:
+        filename = f"{model}.json" if dataset == "gsm8k" else f"{model}_{dataset}.json"
+    path = RESULTS_DIR / filename
     print(f"Loading {path}...", flush=True)
     with open(path) as f:
         data = json.load(f)
@@ -276,6 +316,49 @@ def bootstrap_mean_ci(values, alpha=0.05, n_boot=10000, seed=0, bounds=(0.0, 1.0
 
     lo, hi = (float(np.quantile(boot, q)) for q in quantiles)
     return m, *clamp(lo, hi)
+
+
+def gold_steps_accuracy_stable_match(results, gold_steps, min_samples=5, n_boot=10000, seed=0):
+    """Bucket `results` (a load_results(...)["results"] list) by each
+    sample's gold reasoning step count and compute per-bucket accuracy and
+    stable-match-fraction means with CIs. Shared by plot_by_gold_steps.py's
+    single-model figures and gold_steps_grid.py's combined 3-panel figure so
+    the two can't drift out of sync.
+
+    Returns (step_counts, acc_means, acc_lo, acc_hi, smf_means, smf_lo, smf_hi),
+    all aligned to step_counts (ascending; buckets with fewer than
+    min_samples entries are dropped).
+    """
+    buckets = defaultdict(lambda: {"correct": [], "stable_match_frac": []})
+    for entry in results:
+        idx = entry["sample_idx"]
+        num_gold = gold_steps[idx]
+        is_correct = int(entry["original_result"]["is_correct"][-1])
+        smf = entry["original_result"]["stable_match_frac"]
+        buckets[num_gold]["correct"].append(is_correct)
+        buckets[num_gold]["stable_match_frac"].append(smf)
+
+    step_counts = sorted(k for k, v in buckets.items() if len(v["correct"]) >= min_samples)
+
+    acc_means, acc_lo, acc_hi = [], [], []
+    smf_means, smf_lo, smf_hi = [], [], []
+    for s in step_counts:
+        correct = buckets[s]["correct"]
+        smf_vals = buckets[s]["stable_match_frac"]
+
+        n = len(correct)
+        _, lo, hi = wilson_ci(sum(correct), n)
+        acc_means.append(sum(correct) / n)
+        acc_lo.append(lo)
+        acc_hi.append(hi)
+
+        m, lo2, hi2 = bootstrap_mean_ci(smf_vals, n_boot=n_boot, seed=seed)
+        smf_means.append(m)
+        smf_lo.append(lo2)
+        smf_hi.append(hi2)
+
+    return (np.array(step_counts), np.array(acc_means), acc_lo, acc_hi,
+            np.array(smf_means), smf_lo, smf_hi)
 
 
 def cluster_bootstrap_proportion_ci(groups, categories, alpha=0.05, n_boot=10000, seed=0):

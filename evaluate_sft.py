@@ -6,8 +6,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from eval_common import (
     DATASETS, augment_question, match_fractions, slicing_status,
-    aggregate_and_save, load_test_samples, split_reasoning_steps,
-    FORCE_ANSWER_DELIM, step_token_counts,
+    aggregate_and_save, load_test_samples, load_prosqa_gold_steps,
+    split_reasoning_steps, FORCE_ANSWER_DELIM, step_token_counts,
 )
 
 # Public checkpoints from https://huggingface.co/connordilgren -- raw
@@ -108,8 +108,10 @@ def early_stopping(question, ground_truth_answer, model, tokenizer, dataset):
 # ---------------------------------------------------------------------------
 # Main. Mirrors evaluate_coconut.py / evaluate_codi.py:
 #   * early-stopping analysis on the original question,
-#   * number-augmentation (swap first positive integer for a same-magnitude
-#     random one) + early-stopping analysis on the augmented question,
+#   * question-augmentation (GSM8K: swap first positive integer for a
+#     same-magnitude random one; ProsQA: swap the query's two named class
+#     options everywhere they appear -- see eval_common.augment_question)
+#     + early-stopping analysis on the augmented question,
 #   * slicing analysis: splice the i-th augmented reasoning step into the first
 #     i original steps and categorise the answer as original/augmented/other/tie.
 # For the latent models a "step" is a continuous thought; here it is a textual
@@ -118,11 +120,11 @@ def early_stopping(question, ground_truth_answer, model, tokenizer, dataset):
 # number of steps is data-dependent and the slicing analysis is only run when
 # the original and augmented questions yield the same number of steps.
 #
-# The augmentation/slicing analysis (Section 5 of the paper) is GSM8K-only in
-# practice: it swaps a number in the question, and ProsQA/PrOntoQA questions
-# don't contain any -- augment_question() naturally returns None for them, so
-# every ProsQA/PrOntoQA sample takes the "no_number" skip path below and only
-# the early-stopping / matching-metrics analysis (Section 3) actually runs.
+# The augmentation/slicing analysis (Section 5 of the paper) has no
+# PrOntoQA analogue yet -- augment_question() naturally returns None for it,
+# so every PrOntoQA sample takes the "no_augmentation" skip path below and
+# only the early-stopping / matching-metrics analysis (Section 3) actually
+# runs.
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
@@ -162,6 +164,7 @@ def main():
     model.eval()
 
     samples = load_test_samples(args.dataset)
+    prosqa_gold_steps = load_prosqa_gold_steps() if args.dataset == "prosqa" else None
 
     results = []
 
@@ -171,12 +174,12 @@ def main():
             question, ground_truth_answer, model, tokenizer, args.dataset
         )
 
-        aug_question, _ = augment_question(question)
+        aug_question, _ = augment_question(question, args.dataset, prosqa_gold_steps)
         if aug_question is None:
             results.append({
                 "sample_idx": sample_idx,
                 "original_result": original_result,
-                "skipped": "no_number",
+                "skipped": "no_augmentation",
             })
             continue
 

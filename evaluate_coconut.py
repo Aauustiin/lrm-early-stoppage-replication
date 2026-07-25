@@ -7,7 +7,7 @@ from coconut import Coconut
 
 from eval_common import (
     DATASETS, augment_question, match_fractions, slicing_status,
-    aggregate_and_save, load_test_samples,
+    aggregate_and_save, load_test_samples, load_prosqa_gold_steps,
 )
 
 
@@ -169,6 +169,7 @@ def main():
     model.eval()
 
     samples = load_test_samples(args.dataset)
+    prosqa_gold_steps = load_prosqa_gold_steps() if args.dataset == "prosqa" else None
 
     results = []
 
@@ -176,11 +177,11 @@ def main():
     for sample_idx, (question, ground_truth_answer) in enumerate(samples):
         original_result = early_stopping(question, ground_truth_answer, model, tokenizer, device)
 
-        aug_question, _ = augment_question(question)
+        aug_question, _ = augment_question(question, args.dataset, prosqa_gold_steps)
         if aug_question is None:
             # Remove latent reasoning tokens from results to save space
             del original_result["latent_reasoning_tokens"]
-            results.append({"sample_idx": sample_idx, "original_result": original_result, "skipped": "no_number"})
+            results.append({"sample_idx": sample_idx, "original_result": original_result, "skipped": "no_augmentation"})
             continue
         augmented_result = early_stopping(aug_question, None, model, tokenizer, device)
 

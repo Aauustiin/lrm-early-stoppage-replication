@@ -20,11 +20,12 @@ connordilgren/gpt2-{prosqa,prontoqa}-codi for the other two -- all three are
 raw state_dicts from the same upstream CODI training codebase, just applied
 to different datasets) and runs it on the chosen dataset's test split.
 
-The augmentation/slicing analysis is GSM8K-only in practice: it swaps a
-number in the question, and ProsQA/PrOntoQA questions don't contain any --
-augment_question() naturally returns None for them, so every ProsQA/PrOntoQA
-sample takes the "no_number" skip path and only the early-stopping /
-matching-metrics analysis actually runs.
+The augmentation/slicing analysis (GSM8K: swap the first number; ProsQA: swap
+the query's two named class options everywhere they appear -- see
+eval_common.augment_question) has no PrOntoQA analogue yet -- augment_question()
+naturally returns None for it, so every PrOntoQA sample takes the
+"no_augmentation" skip path and only the early-stopping / matching-metrics
+analysis actually runs.
 
 Requirements:
     pip install torch transformers peft huggingface_hub safetensors accelerate datasets
@@ -50,7 +51,7 @@ sys.path.insert(0, HERE)
 from codi import CODI, ModelArguments, TrainingArguments  # noqa: E402
 from eval_common import (  # noqa: E402
     DATASETS, augment_question, match_fractions, slicing_status,
-    aggregate_and_save, load_test_samples,
+    aggregate_and_save, load_test_samples, load_prosqa_gold_steps,
 )
 
 torch.use_deterministic_algorithms(True)
@@ -371,6 +372,20 @@ def main():
     model.codi.tie_weights()
 
     model.to(device)
+    # codi.py's full_precision branch loads model.codi in float16 whenever
+    # bf16=False (i.e. on CPU) -- despite the flag's name, not float32. Two
+    # problems this causes on CPU: (a) model.prj is a plain nn.Linear
+    # (float32 by construction), so left alone this dtype mismatch crashes
+    # model.prj(latent) with "mat1 and mat2 must have the same dtype"; (b)
+    # PyTorch's CPU backend has no fast native float16 kernels -- benchmarked
+    # at ~3-5x slower than float32 for this exact model/op shapes despite
+    # computing the same thing. Forcing float32 on CPU fixes both and is a
+    # pure win (same or better numerical precision, not a tradeoff). On CUDA
+    # the bf16 cast right below immediately overrides this anyway, so it's a
+    # no-op there.
+    if device.type == "cpu":
+        model.codi = model.codi.float()
+        model.prj = model.prj.float()
     if use_bf16:
         model.to(torch.bfloat16)
     model.eval()
@@ -385,6 +400,7 @@ def main():
 
     # Dataset.
     samples = load_test_samples(args.dataset)
+    prosqa_gold_steps = load_prosqa_gold_steps() if args.dataset == "prosqa" else None
 
     results = []
     num_steps_default = 6
@@ -395,14 +411,14 @@ def main():
             args.dataset, num_steps=num_steps_default,
         )
 
-        aug_question, _ = augment_question(question)
+        aug_question, _ = augment_question(question, args.dataset, prosqa_gold_steps)
         if aug_question is None:
-            # No number to swap: record the original result and move on.
+            # No augmentable structure: record the original result and move on.
             del original_result["latent_reasoning_tokens"]
             results.append({
                 "sample_idx": sample_idx,
                 "original_result": original_result,
-                "skipped": "no_number",
+                "skipped": "no_augmentation",
             })
             continue
 

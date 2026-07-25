@@ -65,7 +65,11 @@ def main():
             "slicing_statuses() docstring."
         ),
     )
+    parser.add_argument("--dataset", choices=["gsm8k", "prosqa", "prontoqa"],
+                        default="gsm8k", help="Which dataset's results to plot (default: gsm8k)")
     args = parser.parse_args()
+
+    suffix = "" if args.dataset == "gsm8k" else f"_{args.dataset}"
 
     # Each question contributes several slicing steps, and steps from the
     # same question are correlated (not independent trials) -- so the CI is
@@ -75,7 +79,7 @@ def main():
     ci_lo = {m: {} for m in MODELS}
     ci_hi = {m: {} for m in MODELS}
     for name in MODELS:
-        with open(RESULTS_DIR / f"{name}.json") as f:
+        with open(RESULTS_DIR / f"{name}{suffix}.json") as f:
             data = json.load(f)
         groups = [
             slicing_statuses(r, args.effective_only)
@@ -118,9 +122,21 @@ def main():
         # segment's vertical midpoint; ha='left' keeps them clear of the
         # bar itself.
         for i, (v, bot) in enumerate(zip(vals, bottoms)):
+            label = f'{v:.0%}'
+            # Suppress "0%" labels: a segment can round to 0% while still
+            # containing real (just rare) trials -- e.g. COCONUT's "Other"
+            # in slicing_status_prosqa.png is 5 non-tie trials out of 2,889,
+            # which rounds to "0%" and reads as "there were zero such
+            # trials" even though the same 5 trials are ~3% of the smaller
+            # effective-only denominator in slicing_status_effective_prosqa.png.
+            # Dropping the misleading label instead of printing "0%" avoids
+            # that false reading; the bar segment itself (plus the legend)
+            # still shows something is there.
+            if label == '0%':
+                continue
             ax.text(
                 x[i] + bar_width / 2 + 0.03, bot + v / 2,
-                f'{v:.0%}',
+                label,
                 ha='left', va='center',
                 color='black',
             )
@@ -148,8 +164,8 @@ def main():
     legend_below(ax, ncol=3, y=-0.12, handlelength=1.2, handletextpad=0.5, columnspacing=1.0)
     style_axes(ax)
 
-    out_name = "slicing_status_effective.png" if args.effective_only else "slicing_status.png"
-    save_figure(fig, FIGURES_DIR / out_name)
+    out_name = "slicing_status_effective" if args.effective_only else "slicing_status"
+    save_figure(fig, FIGURES_DIR / f"{out_name}{suffix}.png")
 
 
 if __name__ == "__main__":
